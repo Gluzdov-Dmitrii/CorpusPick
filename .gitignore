@@ -1,0 +1,23 @@
+# Third-party independent repositories and binaries
+/tagspaces/
+/tagspaces-extensions/
+/apps/
+/downloads/
+# Profiles, caches, private data and derived content must never enter Git
+/evaluation/tsprofile/
+/evaluation/logs/
+/evaluation/results/
+/runtime/
+/data/
+/private/
+/cache/
+.env
+.env.*
+node_modules/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+__pycache__/
+*.py[cod]
+.venv/
