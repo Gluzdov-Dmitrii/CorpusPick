@@ -50,12 +50,31 @@ class GuiSmokeTest(unittest.TestCase):
                 app.tree.selection_set(['a.txt', 'b.txt'])
                 window.update()
                 self.assertEqual(len(app.selected_documents()), 2)
+                # Mock clipboard writes: never read or replace the user's clipboard in tests.
+                with patch.object(window, 'clipboard_clear'), patch.object(window, 'clipboard_append') as append:
+                    app.copy_name()
+                    append.assert_called_once_with('a.txt\nb.txt')
                 self.assertIn('Стр.: 8', app.totals.get())
                 app.sort('pages')
                 self.assertEqual(app.tree.get_children()[0], 'b.txt')
                 app.sort('pages')
                 self.assertEqual(app.tree.get_children()[0], 'a.txt')
                 self.assertTrue(all(app.tree.set(p, 'number') for p in app.tree.get_children()))
+                backup = Path(directory) / 'backup'
+                (backup / 'old folder').mkdir(parents=True)
+                (backup / 'old folder' / 'original.txt').write_text('one')
+                source = Session(backup, Path(directory) / 'backup-state', read_only=True)
+                try:
+                    manifest = Path(directory) / 'structure.csv'
+                    source.export_structure(manifest)
+                finally:
+                    source.close()
+                app.session.import_structure(manifest)
+                app.refreshed()
+                app.tree.selection_set('a.txt')
+                with patch('corpuspick.__main__.show_file') as show:
+                    app.show_in_explorer()
+                    show.assert_called_once_with(root / 'a.txt')
                 app.session.close()
                 app.session = None
         finally:

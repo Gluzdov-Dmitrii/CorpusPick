@@ -3,13 +3,13 @@ import copy
 import os
 from pathlib import Path
 import queue
-import subprocess
 import threading
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from .core import Session, failure
+from .explorer import show_file
 
 
 def totals_text(documents, selected=False):
@@ -115,6 +115,7 @@ class App:
         window.bind('<Configure>', resize)
         self.context = tk.Menu(window, tearoff=False)
         self.context.add_command(label='Показать в Проводнике', command=self.show_in_explorer)
+        self.context.add_command(label='Скопировать название', command=self.copy_name)
         self.context.add_command(label='Копировать пути', command=self.copy_path)
         self.context.add_command(label='Удалить выделенные в корзину     Delete', command=self.delete_selected)
         self.context.add_command(label='Скорее да — поставить / снять     2', command=self.mark)
@@ -326,8 +327,17 @@ class App:
 
     def show_in_explorer(self):
         if self.selected() and not self.busy and os.name == 'nt':
-            path = self.session.safe_path(self.selected()['path'])
-            subprocess.Popen(['explorer.exe', f'/select,{path}'])
+            try:
+                path = self.session.safe_path(self.selected()['path'])
+                show_file(path)
+            except (OSError, ValueError) as exc:
+                messagebox.showerror('Показать в Проводнике', str(exc))
+
+    def copy_name(self):
+        docs = self.selected_documents()
+        if docs:
+            self.window.clipboard_clear()
+            self.window.clipboard_append('\n'.join(Path(d['path']).name for d in docs))
 
     def copy_path(self):
         if self.selected_documents():
