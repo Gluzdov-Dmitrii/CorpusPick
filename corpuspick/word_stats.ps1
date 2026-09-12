@@ -39,13 +39,8 @@ $job = Start-Job -ArgumentList $env:CORPUSPICK_DOCUMENT, $prior -ScriptBlock {
                                                   $null, $documents, $openArguments)
         $stage = 'count'
         $doc.Repaginate()
-        $appendices = 0
-        foreach ($paragraph in $doc.Paragraphs) {
-            if ($paragraph.Range.Text.Trim() -match '^(?i:приложение|appendix)\s+(?:[А-ЯЁA-Z]|\d+)(?:\s*[:.\-–—]\s*.*)?$') { $appendices++ }
-            [void][Runtime.InteropServices.Marshal]::ReleaseComObject($paragraph)
-        }
         [pscustomobject]@{ pages = $doc.ComputeStatistics(2); figures = $doc.InlineShapes.Count + $doc.Shapes.Count;
-                          tables = $doc.Tables.Count; appendices = $appendices }
+                          tables = $doc.Tables.Count }
     } catch {
         [pscustomobject]@{ info = 'Word'; stage = $stage; code = $_.Exception.HResult }
     } finally {
@@ -75,7 +70,7 @@ try {
     } else {
         $result = $items | Where-Object { $_.PSObject.Properties.Name -notcontains 'ownedPid' } | Select-Object -Last 1
         if ($result.PSObject.Properties.Name -contains 'pages') {
-            @{ pages = $result.pages; figures = $result.figures; tables = $result.tables; appendices = $result.appendices } | ConvertTo-Json -Compress
+            @{ pages = $result.pages; figures = $result.figures; tables = $result.tables } | ConvertTo-Json -Compress
         } else {
             @{ info = ('Word: этап {0}, код {1}. Проверьте доступность Word и защиту файла.' -f $result.stage, $result.code) } | ConvertTo-Json -Compress
         }

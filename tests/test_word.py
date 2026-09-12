@@ -21,6 +21,6 @@ class WordIntegration(unittest.TestCase):
             result = word_stats(path)
             self.assertEqual(result.get('pages'), 2, result)
             self.assertEqual(result['tables'], 1)
-            self.assertEqual(result['appendices'], 1)
+            self.assertNotIn('appendices', result)
             self.assertEqual(result['figures'], 0)
             self.assertEqual(original, digest(path))

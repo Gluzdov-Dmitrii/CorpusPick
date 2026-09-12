@@ -3,7 +3,6 @@ import json
 import logging
 import os
 from pathlib import Path
-import re
 import subprocess
 from xml.etree import ElementTree as ET
 from zipfile import ZipFile
@@ -11,7 +10,7 @@ from zipfile import ZipFile
 from .core import native
 
 W = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-APPENDIX = re.compile(r'^\s*(?:приложение|appendix)\s+(?:[А-ЯЁA-Z]|\d+)(?:\s*[:.\-–—]\s*.*)?\s*$', re.I)
+
 
 
 def xml_part(archive, name):
@@ -39,13 +38,10 @@ def document_stats(path):
                 for node in props:
                     if node.tag.endswith('}Pages') and node.text and node.text.isdigit():
                         pages = int(node.text) or None
-            paragraphs = [''.join(t.text or '' for t in p.iter(W + 't')).strip() for p in root.iter(W + 'p')]
             return {'pages': pages, 'pages_estimated': True,
                     'figures': sum(1 for _ in root.iter(W + 'drawing')) + sum(1 for _ in root.iter(W + 'pict')),
                     'tables': sum(1 for _ in root.iter(W + 'tbl')),
-                    'appendices': sum(bool(APPENDIX.fullmatch(p)) for p in paragraphs),
-                    'appendices_estimated': True,
-                    'info': 'DOCX: страницы из сохранённых свойств (могут устареть); рисунки — графические объекты основного текста; приложения ≈ отдельные заголовки «Приложение А/1». Колонтитулы не входят.'}
+                    'info': 'DOCX: страницы из сохранённых свойств (могут устареть); рисунки — графические объекты основного текста. Колонтитулы не входят.'}
     if suffix == '.pdf':
         try:
             from pypdf import PdfReader
@@ -58,9 +54,17 @@ def document_stats(path):
             if reader.is_encrypted and not reader.decrypt(''):
                 return {'info': 'PDF защищён паролем'}
             return {'pages': len(reader.pages),
-                    'info': 'PDF: точное число страниц. Рисунки, таблицы и приложения не определяются: требуется анализ вёрстки/OCR.'}
+                    'info': 'PDF: точное число страниц. Рисунки и таблицы PDF не считаются.'}
     if suffix == '.doc':
-        return {'info': 'Для старого DOC: Инструменты → Подсчитать через Word'}
+        try:
+            import olefile
+        except ImportError:
+            return {'info': 'Для DOC установите requirements.txt'}
+        with olefile.OleFileIO(native(path)) as document:
+            props = document.getproperties('\x05SummaryInformation') if document.exists('\x05SummaryInformation') else {}
+            pages = props.get(14)
+            return {'pages': pages if isinstance(pages, int) and pages > 0 else None, 'pages_estimated': True,
+                    'info': 'DOC: сохранённые страницы (могут устареть). Рисунки и таблицы требуют кнопки «Уточнить Word».'}
     return {'info': 'Подсчёт состава для этого формата не поддерживается'}
 
 
@@ -78,8 +82,8 @@ def word_stats(path):
             return {'info': 'Word недоступен или не смог открыть документ'}
         result = json.loads(process.stdout.decode('utf-8-sig').strip())
         if 'pages' in result:
-            result['info'] = 'Word: страницы после перевёрстки; рисунки — InlineShapes + Shapes; таблицы основного текста; приложения ≈ отдельные заголовки. Файл не сохранялся.'
-            result['appendices_estimated'] = True
+            result['info'] = 'Word: страницы после перевёрстки; рисунки — InlineShapes + Shapes; таблицы основного текста. Файл не сохранялся.'
+            result.pop('appendices', None)
         return result
     except (subprocess.TimeoutExpired, OSError, ValueError):
         return {'info': 'Word не ответил за отведённое время или недоступен'}

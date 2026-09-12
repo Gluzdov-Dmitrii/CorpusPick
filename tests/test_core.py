@@ -54,7 +54,7 @@ class CorpusTests(unittest.TestCase):
         self.put('nested/unreadable.txt', 'read blocked but rename allowed')
         self.put('nested/normal.txt', 'normal')
         real_digest = digest
-        def fake(path):
+        def fake(path, cancel=None):
             if Path(path).name == 'unreadable.txt':
                 raise PermissionError(13, 'synthetic')
             return real_digest(path)
@@ -122,7 +122,8 @@ class CorpusTests(unittest.TestCase):
                 self.session.flatten()
         self.session.close()
         self.session = Session(self.root, self.data)
-        self.assertEqual(self.session.flatten()['moved'], 1)
+        self.session.flatten()
+        self.assertTrue((self.root / 'file.txt').exists())
         self.assertEqual(self.session.scan()[0]['origin'], str(Path('folder/file.txt')))
 
     def test_legacy_link_journal_recovery(self):
@@ -160,7 +161,7 @@ class CorpusTests(unittest.TestCase):
             archive.writestr('word/document.xml', xml)
             archive.writestr('docProps/app.xml', '<Properties xmlns="test"><Pages>9</Pages></Properties>')
         stats = document_stats(path)
-        self.assertEqual([stats[k] for k in ('pages', 'figures', 'tables', 'appendices')], [9, 1, 2, 1])
+        self.assertEqual([stats[k] for k in ('pages', 'figures', 'tables')], [9, 1, 2])
         self.assertTrue(stats['pages_estimated'])
         self.assertNotIn('pages', document_stats(self.put('x.bin', 'unknown')))
 

@@ -7,6 +7,9 @@ import os
 from pathlib import Path
 import stat
 import tempfile
+import threading
+import time
+import uuid
 from collections import Counter
 from .recycle import recycle_file
 
@@ -18,10 +21,16 @@ def is_link(path: Path) -> bool:
     )
 
 
-def digest(path: Path) -> str:
+class Cancelled(Exception):
+    pass
+
+
+def digest(path: Path, cancel=None) -> str:
     hasher = hashlib.sha256()
     with open(native(path), "rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            if cancel is not None and cancel.is_set():
+                raise Cancelled()
             hasher.update(chunk)
     return hasher.hexdigest()
 
@@ -71,7 +80,9 @@ def atomic_json(path: Path, value: dict) -> None:
 
 
 class Session:
-    def __init__(self, root: Path, data_root: Path | None = None):
+    def __init__(self, root: Path, data_root: Path | None = None, read_only=False):
+        self.read_only = read_only
+        self.cancel = threading.Event()
         if is_link(root):
             raise ValueError("Выберите обычный каталог, не ссылку.")
         self.root = root.resolve(strict=True)
@@ -85,6 +96,8 @@ class Session:
             raise ValueError("Каталог состояния не должен находиться внутри выбранного каталога.")
         key = hashlib.sha256(os.path.normcase(str(self.root)).encode()).hexdigest()
         self.state_path = data_root / f"{key}.json"
+        self.journal_path = data_root / f"{key}.moves.jsonl"
+        self.csv_path = data_root / f"{key}.structure.csv"
         self.lock_path = data_root / f"{key}.lock"
         data_root.mkdir(parents=True, exist_ok=True)
         self._lock = self.lock_path.open("a+b")
@@ -109,6 +122,7 @@ class Session:
             }
             if self.state.get("version") != 1:
                 raise ValueError("Неизвестный формат сессии.")
+            self.replay_journal()
         except Exception:
             self.close()
             raise
@@ -134,9 +148,15 @@ class Session:
 
     def walk(self):
         self.state["issues"] = []
+        self.state["directories"] = []
         def error(exc):
             self.state["issues"].append(failure(exc))
         for folder, dirs, files in os.walk(native(self.root), followlinks=False, onerror=error):
+            if self.cancel.is_set():
+                break
+            relative_folder = str(Path(folder).relative_to(Path(native(self.root))))
+            if relative_folder != ".":
+                self.state["directories"].append(relative_folder)
             kept = []
             for name in dirs:
                 try:
@@ -146,6 +166,8 @@ class Session:
                     error(exc)
             dirs[:] = sorted(kept)
             for name in sorted(files):
+                if self.cancel.is_set():
+                    break
                 path = Path(folder) / name
                 try:
                     if not is_link(path) and path.is_file():
@@ -153,43 +175,173 @@ class Session:
                 except OSError as exc:
                     error(exc)
 
-    def scan(self, progress=lambda count: None):
-        old = {d["path"]: d for d in self.state["documents"]}
-        moved = {m["destination"]: m for m in self.state["moves"] if m["done"]}
+    def require_write(self):
+        if self.read_only:
+            raise ValueError('Каталог открыт как бэкап: изменение файлов отключено')
+
+    def replay_journal(self):
+        if not self.journal_path.exists():
+            return
+        moves = {m.get('id'): m for m in self.state['moves'] if m.get('id')}
+        docs = {d['path']: d for d in self.state['documents']}
+        with self.journal_path.open(encoding='utf-8') as stream:
+            for line in stream:
+                if not line.endswith('\n'):
+                    break  # Incomplete final append after power loss.
+                record = json.loads(line)
+                move = moves.get(record['id'])
+                if move:
+                    move['done'] = True
+                    d = docs.pop(move['source'], None)
+                    if d:
+                        d['path'] = move['destination']
+                        d['origin'] = move['origin']
+                        docs[d['path']] = d
+        self.save()
+        self.journal_path.unlink(missing_ok=True)
+
+    def log_move(self, move):
+        with self.journal_path.open('a', encoding='utf-8') as stream:
+            stream.write(json.dumps({'id': move['id']}) + '\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    def regroup(self):
+        counts = Counter(d['hash'] for d in self.state['documents'] if d.get('hash'))
+        groups = {h: i + 1 for i, h in enumerate(sorted(h for h, n in counts.items() if n > 1))}
+        for d in self.state['documents']:
+            d['duplicate'] = groups.get(d.get('hash'), 0)
+
+    def scan(self, progress=lambda count: None, hash_files=True):
+        old = {d['path']: d for d in self.state['documents']}
+        moved = {m['destination']: m for m in self.state['moves'] if m['done']}
         documents = []
         for path, relative in self.walk():
-            item = {"path": relative, "origin": relative, "size": None, "hash": "",
-                    "note": "", "error": "", "stats": {}}
+            if self.cancel.is_set():
+                break
             previous = old.get(relative, {})
+            item = {'path': relative, 'origin': relative, 'size': None, 'hash': '',
+                    'note': '', 'error': '', 'stats': {}}
             try:
                 before = path.stat()
-                item["size"] = before.st_size
-                item["identity"] = [before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns]
-                item["hash"] = digest(path)
-                after = path.stat()
-                if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
-                    item["hash"] = ""
-                    item["error"] = "Файл изменился во время проверки дублей; F5 для обновления"
+                identity = [before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns]
+                item.update(size=before.st_size, identity=identity)
+                if previous.get('identity') == identity:
+                    item = dict(previous)
+                    item['error'] = ''
+                elif previous:
+                    item['origin'] = previous.get('origin', relative)
+                    item['origins'] = previous.get('origins', [item['origin']])
+                movement = moved.get(relative)
+                if movement and movement.get('identity') == identity:
+                    item['origin'] = movement['origin']
+                if hash_files and not item['hash']:
+                    item['hash'] = digest(path, self.cancel)
+                    after = path.stat()
+                    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+                        item['hash'] = ''
+                        item['error'] = 'Файл изменился во время чтения'
+                if movement and item.get('hash') and movement.get('hash') == item['hash']:
+                    item['origin'] = movement['origin']
+                if item.get('hash') and previous.get('hash') == item['hash']:
+                    item['note'] = previous.get('note', 'Скорее да' if previous.get('score') == 2 else '')
+                    item['stats'] = previous.get('stats', {})
+            except Cancelled:
+                documents.append(item)
+                break
             except OSError as exc:
-                item["error"] = failure(exc)
-            movement = moved.get(relative)
-            if movement and (movement.get("hash") == item["hash"] and item["hash"] or
-                             movement.get("identity") == item.get("identity") and item.get("identity")):
-                item["origin"] = movement["origin"]
-            unchanged = item["hash"] and previous.get("hash") == item["hash"]
-            if unchanged:
-                item["origin"] = previous.get("origin", item["origin"])
-                item["note"] = previous.get("note", "Скорее да" if previous.get("score") == 2 else "")
-                item["stats"] = previous.get("stats", {})
+                item['error'] = failure(exc)
             documents.append(item)
             progress(len(documents))
-        counts = Counter(d["hash"] for d in documents if d["hash"])
-        groups = {h: i + 1 for i, h in enumerate(sorted(h for h, n in counts.items() if n > 1))}
-        for item in documents:
-            item["duplicate"] = groups.get(item["hash"], 0)
-        self.state["documents"] = documents
+        if self.cancel.is_set():
+            visited = {d['path'] for d in documents}
+            documents.extend(d for d in old.values() if d['path'] not in visited)
+        self.state['scan_complete'] = not self.cancel.is_set()
+        self.state['documents'] = documents
+        self.regroup()
         self.save()
         return documents
+
+    def analyze(self, progress=lambda count: None, selected=None, hashes=True):
+        from .statistics import document_stats
+        last_save = time.monotonic()
+        for index, d in enumerate(self.state['documents']):
+            if self.cancel.is_set():
+                break
+            if selected is not None and d['path'] not in selected:
+                continue
+            try:
+                path = self.safe_path(d['path'])
+                if hashes and not d.get('hash'):
+                    d['hash'] = digest(path, self.cancel)
+                if not d.get('stats') or d['stats'].get('schema') != 2:
+                    d['stats'] = document_stats(path)
+                    d['stats']['schema'] = 2
+                info = Path(native(path)).stat()
+                if d.get('identity') != [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns]:
+                    d.update(hash='', stats={}, error='Файл изменился: обновите список')
+            except Cancelled:
+                break
+            except OSError as exc:
+                d['error'] = failure(exc)
+            except Exception:
+                d['stats'] = {'schema': 2, 'info': 'Статистика недоступна: файл повреждён или защищён'}
+            progress(index + 1)
+            if time.monotonic() - last_save > 2:
+                self.save()
+                last_save = time.monotonic()
+        self.regroup()
+        self.save()
+
+    def open_catalog(self, progress=lambda count: None):
+        if not self.read_only and os.name == 'nt':
+            self.state['unlock_result'] = self.unlock(progress)
+        self.scan(progress, hash_files=False)
+        progress(0)
+        if not self.cancel.is_set():
+            self.analyze(progress)
+
+    def export_structure(self, destination=None, progress=lambda count: None, prepared=False):
+        from .manifest import write_manifest
+        path = Path(destination) if destination else self.csv_path
+        if path.resolve().is_relative_to(self.root):
+            raise ValueError('Сохраните CSV вне каталога документов, чтобы не менять бэкап и не включать CSV в корпус')
+        if not prepared:
+            self.scan(progress)
+        if self.cancel.is_set() and not prepared:
+            return None
+        directories = set(self.state.get('original_directories', [])) | set(self.state.get('directories', []))
+        for d in self.state['documents']:
+            for origin in d.get('origins', [d['origin']]):
+                directories.update(str(p) for p in Path(origin).parents if p != Path('.'))
+        write_manifest(path, self.state['documents'], directories)
+        return str(path)
+
+    def import_structure(self, path, progress=lambda count: None):
+        from .manifest import read_manifest
+        rows, directories = read_manifest(path)
+        self.scan(progress)
+        if self.cancel.is_set():
+            return {'matched': 0, 'ambiguous': 0, 'unmatched': 0, 'stopped': True}
+        groups = {}
+        for row in rows:
+            if row['hash']:
+                groups.setdefault((row['hash'], row['size']), set()).update(row['origins'])
+        result = {'matched': 0, 'ambiguous': 0, 'unmatched': 0}
+        for d in self.state['documents']:
+            origins = sorted(groups.get((d.get('hash'), d.get('size')), []))
+            if origins:
+                d['origins'] = origins
+                d['origin'] = origins[0] if len(origins) == 1 else d['path']
+                d['origin_match'] = 'SHA-256' if len(origins) == 1 else 'Несколько исходных путей с одинаковым SHA-256'
+                result['matched'] += 1
+                result['ambiguous'] += len(origins) > 1
+            else:
+                result['unmatched'] += 1
+        self.state['original_directories'] = directories
+        self.state['imported_manifest'] = str(Path(path).resolve())
+        self.save()
+        return result
 
     def mark(self, relative):
         item = next(d for d in self.state["documents"] if d["path"] == relative)
@@ -215,16 +367,20 @@ class Session:
         identity = [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns]
         if not path.is_file() or not document.get('identity') or identity != document['identity']:
             raise ValueError('Файл изменился после обновления списка; нажмите F5 и повторите')
-        if verify_hash and (not document.get('hash') or digest(path) != document['hash']):
+        if verify_hash and (not document.get('hash') or digest(path, self.cancel) != document['hash']):
             raise ValueError('Содержимое изменилось: удаление дубля отменено')
         return self.safe_path(document['path'])
 
     def trash_documents(self, documents=None, duplicate_plan=None, progress=lambda count: None):
+        self.require_write()
         if any(not m['done'] for m in self.state['moves']):
-            raise ValueError('Сначала завершите перенос или сбросьте его план в меню «Инструменты»')
+            raise ValueError('Сначала завершите перенос или нажмите «Сбросить план»')
         result = {'trashed': 0, 'errors': []}
+        removed_paths = set()
         entries = duplicate_plan if duplicate_plan is not None else [{'remove': d} for d in documents or []]
         for index, entry in enumerate(entries):
+            if self.cancel.is_set():
+                break
             document = entry['remove']
             try:
                 if 'keep' in entry:
@@ -234,35 +390,53 @@ class Session:
                 path = self.checked_document(document, verify_hash='keep' in entry)
                 recycle_file(path)
                 result['trashed'] += 1
+                removed_paths.add(document['path'])
+            except Cancelled:
+                break
             except (OSError, ValueError) as exc:
                 result['errors'].append({'path': document['path'],
                                         'error': str(exc) if isinstance(exc, ValueError) else failure(exc)})
             progress(index + 1)
+        self.state['documents'] = [d for d in self.state['documents'] if d['path'] not in removed_paths]
         self.scan(progress)
         return result
 
     def flatten(self, progress=lambda count: None):
+        self.require_write()
         pending = [m for m in self.state["moves"] if not m["done"]]
         if not pending:
             # Explorer may have changed the folder since the last scan.
             self.scan(progress)
+            if self.cancel.is_set():
+                return {"moved": 0, "errors": [], "stopped": True}
+            self.state["original_directories"] = sorted(set(self.state.get("original_directories", [])) | set(self.state.get("directories", [])))
             occupied = {p.name.casefold() for p in Path(native(self.root)).iterdir()}
+            suffixes = {}
             for document in self.state["documents"]:
                 source = Path(document["path"])
                 if source.parent == Path("."):
                     continue
-                name, number = source.name, 1
+                name, number = source.name, suffixes.get(source.name.casefold(), 1)
                 while name.casefold() in occupied:
-                    name = f"{source.stem}__{number}{source.suffix}"
+                    tail = f"__{number}{source.suffix}"
+                    name = source.stem[:max(1, 240 - len(tail))] + tail
                     number += 1
+                suffixes[source.name.casefold()] = number
                 occupied.add(name.casefold())
                 pending.append({"source": str(source), "destination": name, "origin": document["origin"],
                                 "hash": document["hash"], "identity": document.get("identity"),
                                 "method": "rename", "done": False})
             self.state["moves"].extend(pending)
             self.save()
+        for move in pending:
+            move.setdefault('id', uuid.uuid4().hex)
+        self.save()
+        self.export_structure(prepared=True)
+        documents_by_path = {d['path']: d for d in self.state['documents']}
         result = {"moved": 0, "errors": []}
         for index, move in enumerate(pending):
+            if self.cancel.is_set():
+                break
             try:
                 source = self.safe_path(move["source"])
                 destination = self.safe_path(move["destination"])
@@ -271,7 +445,7 @@ class Session:
                     if move.get("method") != "rename":
                         # Recover journals made by the first hard-link version.
                         if digest(src) != move["hash"]:
-                            raise ValueError("Файл изменён; сбросьте незавершённый план в меню «Инструменты»")
+                            raise ValueError("Файл изменён; нажмите «Сбросить план»")
                         if dst.exists():
                             if not os.path.samefile(src, dst):
                                 raise FileExistsError()
@@ -282,7 +456,7 @@ class Session:
                         before = src.stat()
                         identity = [before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns]
                         if move.get("identity") and identity != move["identity"]:
-                            raise ValueError("Файл изменён; сбросьте незавершённый план в меню «Инструменты»")
+                            raise ValueError("Файл изменён; нажмите «Сбросить план»")
                         move_exclusive(src, dst)
                 elif dst.is_file():
                     info = dst.stat()
@@ -293,21 +467,27 @@ class Session:
                     raise FileNotFoundError()
                 move["done"] = True
                 move.pop("error", None)
-                for document in self.state["documents"]:
-                    if document["path"] == move["source"]:
-                        document["path"] = move["destination"]
-                        document["origin"] = move["origin"]
+                document = documents_by_path.pop(move['source'], None)
+                if document:
+                    document['path'] = move['destination']
+                    document['origin'] = move['origin']
+                    documents_by_path[document['path']] = document
                 result["moved"] += 1
             except (OSError, ValueError) as exc:
                 move["error"] = str(exc) if isinstance(exc, ValueError) else failure(exc)
                 result["errors"].append({"path": move["source"], "error": move["error"]})
-            # Storage errors must stop the operation; do not continue without journal.
-            self.save()
+            if move["done"]:
+                self.log_move(move)
             progress(index + 1)
-        self.scan(progress)
+        self.save()
+        self.journal_path.unlink(missing_ok=True)
+        self.export_structure(prepared=True)
+        result['csv'] = str(self.csv_path)
+        result['stopped'] = self.cancel.is_set()
         return result
 
     def remove_empty_directories(self):
+        self.require_write()
         folders = []
         errors = []
         for folder, dirs, _ in os.walk(native(self.root), followlinks=False,
@@ -324,6 +504,8 @@ class Session:
             dirs[:] = kept
         removed = 0
         for folder in reversed(folders):
+            if self.cancel.is_set():
+                break
             try:
                 folder.rmdir()
                 removed += 1
@@ -333,6 +515,7 @@ class Session:
         return {"removed": removed, "errors": errors}
 
     def cancel_pending(self):
+        self.require_write()
         for move in self.state["moves"]:
             if move["done"]:
                 continue
@@ -346,6 +529,7 @@ class Session:
         self.save()
 
     def unlock(self, progress=lambda count: None):
+        self.require_write()
         if os.name != "nt":
             raise ValueError("Unlock доступен только в Windows")
         result = {"unlocked": 0, "unchanged": 0, "errors": []}
@@ -361,19 +545,21 @@ class Session:
         result["errors"].extend({"path": "Каталог", "error": e} for e in self.state["issues"])
         return result
 
-    def collect_stats(self, progress=lambda count: None, use_word=False):
-        from .statistics import document_stats, word_stats
-        self.scan(progress)
-        for index, document in enumerate(self.state["documents"]):
-            path = self.safe_path(document["path"])
-            try:
-                before = Path(native(path)).stat()
-                result = word_stats(path) if use_word and path.suffix.lower() in (".doc", ".docx") else document_stats(path)
-                after = Path(native(path)).stat()
-                if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
-                    result = {"info": "Файл изменился во время подсчёта; повторите"}
-                document["stats"] = result
-            except Exception:
-                document["stats"] = {"info": "Не удалось посчитать: файл недоступен, повреждён или защищён"}
+    def collect_stats(self, progress=lambda count: None, use_word=False, selected=None):
+        from .statistics import word_stats
+        if use_word and self.read_only:
+            raise ValueError('В режиме бэкапа доступен только быстрый подсчёт без запуска Word')
+        self.scan(progress, hash_files=False)
+        if not use_word:
+            return self.analyze(progress, selected=selected, hashes=False)
+        for index, d in enumerate(self.state['documents']):
+            if self.cancel.is_set():
+                break
+            if selected is not None and d['path'] not in selected:
+                continue
+            if Path(d['path']).suffix.lower() not in ('.doc', '.docx'):
+                continue
+            d['stats'] = word_stats(self.safe_path(d['path']))
+            d['stats']['schema'] = 2
             progress(index + 1)
         self.save()
