@@ -5,7 +5,7 @@ import time
 import unittest
 from urllib.parse import unquote
 
-from corpuspick.explorer import show_file
+from corpuspick.explorer import show_file, show_files
 
 
 class ExplorerTests(unittest.TestCase):
@@ -26,28 +26,37 @@ class ExplorerTests(unittest.TestCase):
                 target = root / 'Отчёт, тест 1.txt'
                 target.write_text('Synthetic fixture', encoding='utf-8')
                 (root / 'other.txt').write_text('Synthetic neighbour')
-                show_file(target)
+                (root / 'unselected.txt').write_text('Not selected')
+                nested = root / 'nested'
+                nested.mkdir()
+                (nested / 'third.txt').write_text('Synthetic nested selection')
+                targets = {root: {target, root / 'other.txt'}, nested: {nested / 'third.txt'}}
+                show_files([p for paths in targets.values() for p in paths])
                 shell = Dispatch('Shell.Application')
                 found = False
                 deadline = time.monotonic() + 15
-                owned_window = None
+                owned_windows = {}
                 try:
                     while time.monotonic() < deadline and not found:
+                        matched = set()
                         for window in shell.Windows():
                             # Inspect selection only inside the exact synthetic folder.
                             try:
-                                if unquote(window.LocationURL).casefold() != unquote(root.as_uri()).casefold():
+                                folder = next((p for p in targets if unquote(window.LocationURL).casefold() == unquote(p.as_uri()).casefold()), None)
+                                if folder is None:
                                     continue
-                                owned_window = window
+                                owned_windows[folder] = window
                                 items = window.Document.SelectedItems()
-                                found = items.Count == 1 and Path(items.Item(0).Path) == target
+                                if {Path(items.Item(i).Path) for i in range(items.Count)} == targets[folder]:
+                                    matched.add(folder)
                             except pythoncom.com_error:
                                 continue
+                        found = matched == set(targets)
                         if not found:
                             time.sleep(.1)
                     self.assertTrue(found, 'Synthetic file was not selected')
                 finally:
-                    if owned_window is not None:
-                        owned_window.Quit()
+                    for window in owned_windows.values():
+                        window.Quit()
         finally:
             pythoncom.CoUninitialize()

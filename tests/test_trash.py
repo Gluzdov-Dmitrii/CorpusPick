@@ -32,7 +32,7 @@ class TrashTests(unittest.TestCase):
         destination = self.bin / str(len(list(self.bin.iterdir())))
         path.rename(destination)
 
-    def test_duplicates_keep_marked_then_root(self):
+    def test_duplicates_ignore_legacy_mark_keep_root(self):
         self.put('root.txt')
         self.put('a/nested.txt')
         self.put('b/copy.txt')
@@ -41,11 +41,11 @@ class TrashTests(unittest.TestCase):
         self.session.mark(str(Path('a/nested.txt')))
         plan = self.session.duplicate_plan()
         self.assertEqual(len(plan), 2)
-        self.assertEqual(plan[0]['keep']['path'], str(Path('a/nested.txt')))
+        self.assertEqual(plan[0]['keep']['path'], 'root.txt')
         with patch('corpuspick.core.recycle_file', self.fake_recycle):
             result = self.session.trash_documents(duplicate_plan=plan)
         self.assertEqual(result['trashed'], 2)
-        self.assertTrue((self.root / 'a/nested.txt').exists())
+        self.assertTrue((self.root / 'root.txt').exists())
         self.assertTrue((self.root / 'unique.txt').exists())
         self.assertEqual(len(self.session.state['documents']), 2)
 

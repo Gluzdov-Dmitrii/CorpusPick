@@ -9,7 +9,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from .core import Session, failure
-from .explorer import show_file
+from .explorer import show_files
 
 
 def totals_text(documents, selected=False):
@@ -37,6 +37,7 @@ class App:
         self.last_tick = 0
         self.sort_column, self.sort_reverse = 'number', False
         self.similarity_ranks = {}
+        self.similarity_groups = {}
         self.search, self.filter = tk.StringVar(), tk.StringVar(value='Все файлы')
         self.backup_mode = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value='Откройте каталог. Для нетронутого бэкапа сначала включите режим «Бэкап».')
@@ -80,22 +81,24 @@ class App:
         ttk.Label(filters, text='Файл / исходная папка:').grid(row=0, column=0, padx=(0, 8))
         ttk.Entry(filters, textvariable=self.search).grid(row=0, column=1, sticky='ew')
         ttk.Combobox(filters, textvariable=self.filter, state='readonly', width=19,
-                     values=['Все файлы', 'Точные дубли', 'Есть ошибки', 'Скорее да']).grid(row=0, column=2, padx=(8, 0))
+                     values=['Все файлы', 'Точные дубли', 'Есть ошибки']).grid(row=0, column=2, padx=(8, 0))
         for column, label, fn in [(3, 'По похожести', self.sort_similar), (4, 'Убрать префикс', self.trim_names)]:
             button = ttk.Button(filters, text=label, command=fn)
             button.grid(row=0, column=column, padx=(8, 0))
             self.buttons.append(button)
+            if column == 3:
+                self.similarity_button = button
             if column == 4:
                 self.mutation_buttons.append(button)
         listing = ttk.Frame(window, padding=(10, 0))
         listing.grid(row=3, column=0, sticky='nsew')
         listing.columnconfigure(0, weight=1)
         listing.rowconfigure(0, weight=1)
-        self.columns = ('number', 'name', 'folder', 'origin', 'type', 'size', 'duplicate', 'pages', 'figures', 'tables', 'note')
+        self.columns = ('number', 'name', 'folder', 'origin', 'type', 'size', 'duplicate', 'pages', 'figures', 'tables')
         self.tree = ttk.Treeview(listing, columns=self.columns, show='headings', selectmode='extended')
-        titles = ['№', 'Файл', 'Текущая папка', 'Исходный путь / варианты', 'Тип', 'Байт', 'Дубль', 'Стр.', 'Рис.', 'Табл.', 'Метка']
+        titles = ['№', 'Файл', 'Текущая папка', 'Исходный путь / варианты', 'Тип', 'Байт', 'Дубль', 'Стр.', 'Рис.', 'Табл.']
         self.titles = dict(zip(self.columns, titles))
-        for column, title, width in zip(self.columns, titles, [50, 220, 110, 240, 55, 90, 60, 65, 60, 60, 90]):
+        for column, title, width in zip(self.columns, titles, [50, 220, 110, 240, 55, 90, 60, 65, 60, 60]):
             self.tree.heading(column, text=title, command=lambda c=column: self.sort(c))
             self.tree.column(column, width=width, minwidth=40, stretch=column in ('name', 'origin'),
                              anchor='e' if column in ('number', 'size', 'pages', 'figures', 'tables') else 'w')
@@ -125,14 +128,12 @@ class App:
         self.context.add_command(label='Скопировать название', command=self.copy_name)
         self.context.add_command(label='Копировать пути', command=self.copy_path)
         self.context.add_command(label='Удалить выделенные в корзину     Delete', command=self.delete_selected)
-        self.context.add_command(label='Скорее да — поставить / снять     2', command=self.mark)
         self.context.add_command(label='Снять выделение', command=self.clear_selection)
         self.tree.bind('<Button-3>', self.popup)
         self.tree.bind('<<TreeviewSelect>>', self.select)
         self.tree.bind('<Double-1>', lambda _: self.show_in_explorer())
         self.tree.bind('<Return>', lambda _: self.show_in_explorer())
         self.tree.bind('<Delete>', lambda _: self.delete_selected())
-        self.tree.bind('2', lambda _: self.mark())
         self.tree.bind('<Control-KeyPress>', self.control_key)
         window.bind('<Control-KeyPress>', self.control_key)
         window.bind('<F5>', lambda _: self.scan())
@@ -230,6 +231,10 @@ class App:
         if self.session:
             self.session.close()
         self.session = session
+        self.similarity_groups = {}
+        self.similarity_ranks = {}
+        self.similarity_button.configure(text='По похожести')
+        self.sort_column, self.sort_reverse = 'number', False
         self.view_docs = []
         self.window.title(f"CorpusPick — {'БЭКАП, БЕЗ ИЗМЕНЕНИЙ — ' if session.read_only else ''}{chosen}")
         self.scan()
@@ -269,12 +274,15 @@ class App:
             return {'name': Path(d['path']).name, 'folder': str(Path(d['path']).parent),
                     'origin': ' | '.join(d.get('origins', [d['origin']])),
                     'type': Path(d['path']).suffix}.get(c, d.get(c, '')).casefold()
-        for number, d in sorted(indexed, key=key, reverse=self.sort_reverse):
+        ordered = sorted(indexed, key=key, reverse=self.sort_reverse)
+        if self.similarity_groups:
+            ordered.sort(key=lambda pair: self.similarity_groups.get(pair[1]['path'], len(self.similarity_groups) + pair[0]))
+        for number, d in ordered:
             origins = d.get('origins', [d['origin']])
             if self.search.get().casefold() not in (d['path'] + ' ' + ' '.join(origins)).casefold():
                 continue
             f = self.filter.get()
-            if f == 'Точные дубли' and not d.get('duplicate') or f == 'Есть ошибки' and not (d.get('error') or d.get('stats', {}).get('failed')) or f == 'Скорее да' and not d.get('note'):
+            if f == 'Точные дубли' and not d.get('duplicate') or f == 'Есть ошибки' and not (d.get('error') or d.get('stats', {}).get('failed')):
                 continue
             stats = d.get('stats', {})
             def metric(name):
@@ -283,7 +291,7 @@ class App:
             self.tree.insert('', 'end', iid=d['path'], values=(number, Path(d['path']).name, str(Path(d['path']).parent),
                 ' | '.join(origins), Path(d['path']).suffix.lower() or '—', d.get('size') if d.get('size') is not None else '—',
                 f"#{d['duplicate']}" if d.get('duplicate') else ('?' if not d.get('hash') else '—'), metric('pages'),
-                metric('figures'), metric('tables'), d.get('note', '')),
+                metric('figures'), metric('tables')),
                 tags=('error',) if d.get('error') or stats.get('failed') else ())
         existing = [p for p in selected if self.tree.exists(p)]
         if existing:
@@ -323,15 +331,23 @@ class App:
     def sort_similar(self):
         if self.busy or not self.session:
             return
+        if self.similarity_groups:
+            self.similarity_groups = {}
+            self.similarity_ranks = {}
+            self.similarity_button.configure(text='По похожести')
+            self.sort_column, self.sort_reverse = 'number', False
+            self.refreshed()
+            return
         from .similarity import similar_order
         docs = copy.deepcopy(self.view_docs)
         def done(ranks):
             if ranks is not None:
-                self.similarity_ranks = ranks
+                self.similarity_ranks, self.similarity_groups = ranks
+                self.similarity_button.configure(text='Снять группировку')
                 self.sort_column, self.sort_reverse = 'similarity', False
                 self.render()
-                self.status.set('По похожести названий → размеру → типу. Это не проверка дублей.')
-        self.run('Группировка похожих названий', lambda: similar_order(docs, self.session.cancel, self.tick), done)
+                self.status.set('Группировка по похожести: заголовки сортируют внутри групп. Это не проверка дублей.')
+        self.run('Группировка похожих названий', lambda: similar_order(docs, self.session.cancel, self.tick, with_groups=True), done)
 
     def trim_names(self):
         docs = copy.deepcopy(self.selected_documents())
@@ -358,17 +374,11 @@ class App:
                 self.tree.selection_set(row)
             self.context.tk_popup(event.x_root, event.y_root)
 
-    def mark(self):
-        if not self.busy and self.session:
-            for d in self.selected_documents():
-                self.session.mark(d['path'])
-            self.refreshed()
-
     def show_in_explorer(self):
-        if self.selected() and not self.busy and os.name == 'nt':
+        docs = self.selected_documents()
+        if docs and not self.busy and os.name == 'nt':
             try:
-                path = self.session.safe_path(self.selected()['path'])
-                show_file(path)
+                show_files([self.session.safe_path(d['path']) for d in docs])
             except (OSError, ValueError) as exc:
                 messagebox.showerror('Показать в Проводнике', str(exc))
 
@@ -407,7 +417,7 @@ class App:
                 return
             if not plan:
                 self.result('Дубликаты', 'Лишних точных копий в области выбора нет.')
-            elif messagebox.askyesno('Дубликаты', f'Отправить в корзину {len(plan)} копий?\nСохраняется один экземпляр: с меткой, ближе к корню, затем по имени.\n' +
+            elif messagebox.askyesno('Дубликаты', f'Отправить в корзину {len(plan)} копий?\nСохраняется один экземпляр: ближе к корню, затем по имени.\n' +
                                     ('Удаляются только выделенные лишние копии.' if selected else 'Проверяется весь каталог.')):
                 self.run('Удаление дублей', lambda: self.session.trash_documents(duplicate_plan=plan, progress=self.tick),
                          lambda r: self.result('Дубликаты', f"Отправлено: {r['trashed']}", r['errors']))

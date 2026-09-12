@@ -5,9 +5,17 @@ from pathlib import Path
 
 
 def show_file(path):
-    path = Path(path).absolute()
-    if not path.is_file():
-        raise FileNotFoundError('Файл отсутствует. Обновите список: возможно, он перемещён в Проводнике.')
+    show_files([path])
+
+
+def show_files(paths):
+    folders = {}
+    for path in dict.fromkeys(Path(p).absolute() for p in paths):
+        if not path.is_file():
+            raise FileNotFoundError('Файл отсутствует. Обновите список: возможно, он перемещён в Проводнике.')
+        folders.setdefault(path.parent, []).append(path)
+    if not folders:
+        return
     shell = ctypes.WinDLL('shell32')
     ole = ctypes.WinDLL('ole32')
     ole.CoInitializeEx.argtypes = [ctypes.c_void_p, wintypes.DWORD]
@@ -19,19 +27,28 @@ def show_file(path):
     shell.SHParseDisplayName.restype = ctypes.c_long
     shell.SHOpenFolderAndSelectItems.argtypes = [ctypes.c_void_p, wintypes.UINT, ctypes.c_void_p, wintypes.DWORD]
     shell.SHOpenFolderAndSelectItems.restype = ctypes.c_long
+    shell.ILFindLastID.argtypes = [ctypes.c_void_p]
+    shell.ILFindLastID.restype = ctypes.c_void_p
     initialized = ole.CoInitializeEx(None, 2)
     # RPC_E_CHANGED_MODE means COM was already initialized in another apartment.
     if initialized < 0 and initialized != -2147417850:
         raise OSError('Не удалось подключиться к Проводнику')
-    item = ctypes.c_void_p()
     try:
-        if shell.SHParseDisplayName(str(path), None, ctypes.byref(item), 0, None) < 0:
-            raise OSError('Проводник не смог найти файл. Обновите список.')
-        # With zero children the absolute PIDL denotes the file; Shell opens its parent.
-        if shell.SHOpenFolderAndSelectItems(item, 0, None, 0) < 0:
-            raise OSError('Не удалось выделить файл в Проводнике')
+        for folder, files in folders.items():
+            allocated = []
+            try:
+                for path in [folder, *files]:
+                    item = ctypes.c_void_p()
+                    allocated.append(item)
+                    if shell.SHParseDisplayName(str(path), None, ctypes.byref(item), 0, None) < 0:
+                        raise OSError('Проводник не смог найти файл. Обновите список.')
+                children = (ctypes.c_void_p * len(files))(*(shell.ILFindLastID(p) for p in allocated[1:]))
+                if shell.SHOpenFolderAndSelectItems(allocated[0], len(files), children, 0) < 0:
+                    raise OSError('Не удалось выделить файлы в Проводнике')
+            finally:
+                for item in allocated:
+                    if item:
+                        ole.CoTaskMemFree(item)
     finally:
-        if item:
-            ole.CoTaskMemFree(item)
         if initialized >= 0:
             ole.CoUninitialize()

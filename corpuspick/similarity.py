@@ -9,7 +9,7 @@ def name_key(path):
     return ' '.join(sorted(re.findall(r'\w+', name)))
 
 
-def similar_order(documents, cancel, progress=lambda count: None):
+def similar_order(documents, cancel, progress=lambda count: None, with_groups=False):
     names = [name_key(d['path']) for d in documents]
     grams = [{s[j:j + 3] for j in range(max(1, len(s) - 2))} for s in names]
     parents = list(range(len(documents)))
@@ -36,4 +36,12 @@ def similar_order(documents, cancel, progress=lambda count: None):
     ordered = sorted(range(len(names)), key=lambda i: (
         group_keys[find(i)], names[i], documents[i].get('size') or 0,
         Path(documents[i]['path']).suffix.casefold(), documents[i]['path']))
-    return {documents[i]['path']: rank for rank, i in enumerate(ordered)}
+    ranks = {documents[i]['path']: rank for rank, i in enumerate(ordered)}
+    if with_groups:
+        group_numbers = {}
+        groups = {}
+        for i in ordered:
+            group = find(i)
+            groups[documents[i]['path']] = group_numbers.setdefault(group, len(group_numbers))
+        return ranks, groups
+    return ranks

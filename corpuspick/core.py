@@ -358,8 +358,7 @@ class Session:
                 groups.setdefault(document['hash'], []).append(document)
         plan = []
         for documents in groups.values():
-            ordered = sorted(documents, key=lambda d: (not bool(d.get('note')),
-                             len(Path(d['path']).parts), d['path'].casefold(), d['path']))
+            ordered = sorted(documents, key=lambda d: (len(Path(d['path']).parts), d['path'].casefold(), d['path']))
             plan.extend({'keep': dict(ordered[0]), 'remove': dict(d)} for d in ordered[1:])
         return plan
 

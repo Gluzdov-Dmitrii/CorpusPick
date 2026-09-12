@@ -38,6 +38,8 @@ class GuiSmokeTest(unittest.TestCase):
                 self.assertIn('pages', app.tree['columns'])
                 self.assertNotIn('appendices', app.tree['columns'])
                 self.assertNotIn('error', app.tree['columns'])
+                self.assertNotIn('note', app.tree['columns'])
+                self.assertFalse(app.tree.bind('2'))
                 for keysym, keycode in [('a', 65), ('A', 65), ('Cyrillic_ef', 65)]:
                     app.tree.selection_remove(app.tree.selection())
                     self.assertEqual(app.control_key(SimpleNamespace(widget=app.tree, keysym=keysym, keycode=keycode)), 'break')
@@ -75,6 +77,23 @@ class GuiSmokeTest(unittest.TestCase):
                 app.sort('pages')
                 self.assertEqual(app.tree.get_children()[0], 'a.txt')
                 self.assertTrue(all(app.tree.set(p, 'number') for p in app.tree.get_children()))
+                # Interleaved sizes must sort within groups, never split them.
+                saved_docs = app.view_docs
+                app.view_docs = [dict(saved_docs[0], path=p, size=size, origin=p) for p, size in [
+                    ('report 2024.pdf', 30), ('report 2025.pdf', 10), ('letter x.txt', 40), ('letter y.txt', 20)]]
+                app.sort_similar()
+                settle()
+                # Completion refreshes the session view; use the synthetic grouping fixture again.
+                app.view_docs = [dict(saved_docs[0], path=p, size=size, origin=p) for p, size in [
+                    ('report 2024.pdf', 30), ('report 2025.pdf', 10), ('letter x.txt', 40), ('letter y.txt', 20)]]
+                self.assertEqual(app.similarity_groups['report 2024.pdf'], app.similarity_groups['report 2025.pdf'])
+                self.assertNotEqual(app.similarity_groups['report 2024.pdf'], app.similarity_groups['letter x.txt'])
+                app.sort('size')
+                self.assertEqual(app.tree.get_children(), ('report 2025.pdf', 'report 2024.pdf', 'letter y.txt', 'letter x.txt'))
+                app.sort('size')
+                self.assertEqual(app.tree.get_children(), ('report 2024.pdf', 'report 2025.pdf', 'letter x.txt', 'letter y.txt'))
+                app.sort_similar()
+                self.assertFalse(app.similarity_groups)
                 backup = Path(directory) / 'backup'
                 (backup / 'old folder').mkdir(parents=True)
                 (backup / 'old folder' / 'original.txt').write_text('one')
@@ -86,10 +105,10 @@ class GuiSmokeTest(unittest.TestCase):
                     source.close()
                 app.session.import_structure(manifest)
                 app.refreshed()
-                app.tree.selection_set('a.txt')
-                with patch('corpuspick.__main__.show_file') as show:
+                app.tree.selection_set(['a.txt', 'b.txt'])
+                with patch('corpuspick.__main__.show_files') as show:
                     app.show_in_explorer()
-                    show.assert_called_once_with(root.resolve() / 'a.txt')
+                    show.assert_called_once_with([root.resolve() / 'a.txt', root.resolve() / 'b.txt'])
                 app.session.close()
                 app.session = None
         finally:
