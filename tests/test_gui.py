@@ -36,6 +36,10 @@ class GuiSmokeTest(unittest.TestCase):
                 self.assertFalse(hasattr(app, 'tools_menu'))
                 self.assertIn('pages', app.tree['columns'])
                 self.assertNotIn('appendices', app.tree['columns'])
+                self.assertNotIn('error', app.tree['columns'])
+                app.last_tick = 0
+                app.tick(10)
+                self.assertEqual(app.events.get_nowait(), ('progress', 10))
                 app.session.state['documents'][0]['stats'] = {'pages': 5, 'tables': 2}
                 app.session.state['documents'][1]['stats'] = {'pages': 3, 'tables': 1}
                 app.refreshed()

@@ -263,33 +263,37 @@ class Session:
         return documents
 
     def analyze(self, progress=lambda count: None, selected=None, hashes=True):
-        from .statistics import document_stats
+        from .stats_worker import StatsWorker
         last_save = time.monotonic()
-        for index, d in enumerate(self.state['documents']):
-            if self.cancel.is_set():
-                break
-            if selected is not None and d['path'] not in selected:
-                continue
-            try:
-                path = self.safe_path(d['path'])
-                if hashes and not d.get('hash'):
-                    d['hash'] = digest(path, self.cancel)
-                if not d.get('stats') or d['stats'].get('schema') != 2:
-                    d['stats'] = document_stats(path)
-                    d['stats']['schema'] = 2
-                info = Path(native(path)).stat()
-                if d.get('identity') != [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns]:
-                    d.update(hash='', stats={}, error='Файл изменился: обновите список')
-            except Cancelled:
-                break
-            except OSError as exc:
-                d['error'] = failure(exc)
-            except Exception:
-                d['stats'] = {'schema': 2, 'info': 'Статистика недоступна: файл повреждён или защищён'}
-            progress(index + 1)
-            if time.monotonic() - last_save > 2:
-                self.save()
-                last_save = time.monotonic()
+        documents = [d for d in self.state['documents'] if selected is None or d['path'] in selected]
+        with StatsWorker() as worker:
+            for index, d in enumerate(documents):
+                if self.cancel.is_set():
+                    break
+                try:
+                    path = self.safe_path(d['path'])
+                    if hashes and not d.get('hash'):
+                        d['hash'] = digest(path, self.cancel)
+                    stats = d.get('stats', {})
+                    if not stats or stats.get('schema') != 2 or stats.get('failed'):
+                        if path.suffix.lower() in ('.doc', '.docx', '.pdf') and not path.name.startswith('~$'):
+                            d['stats'] = worker.count(path, self.cancel)
+                        else:
+                            d['stats'] = {'info': 'Подсчёт для этого формата не поддерживается'}
+                        d['stats']['schema'] = 2
+                    info = Path(native(path)).stat()
+                    if d.get('identity') != [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns]:
+                        d.update(hash='', stats={}, error='Файл изменился: обновите список')
+                except Cancelled:
+                    break
+                except OSError as exc:
+                    d['error'] = failure(exc)
+                except Exception:
+                    d['stats'] = {'schema': 2, 'failed': True, 'info': 'Не удалось запустить или выполнить подсчёт'}
+                progress(index + 1)
+                if time.monotonic() - last_save > 5:
+                    self.save()
+                    last_save = time.monotonic()
         self.regroup()
         self.save()
 
@@ -298,8 +302,6 @@ class Session:
             self.state['unlock_result'] = self.unlock(progress)
         self.scan(progress, hash_files=False)
         progress(0)
-        if not self.cancel.is_set():
-            self.analyze(progress)
 
     def export_structure(self, destination=None, progress=lambda count: None, prepared=False):
         from .manifest import write_manifest

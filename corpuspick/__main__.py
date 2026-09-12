@@ -84,13 +84,13 @@ class App:
         listing.grid(row=3, column=0, sticky='nsew')
         listing.columnconfigure(0, weight=1)
         listing.rowconfigure(0, weight=1)
-        self.columns = ('number', 'name', 'folder', 'origin', 'type', 'size', 'duplicate', 'pages', 'figures', 'tables', 'note', 'error')
+        self.columns = ('number', 'name', 'folder', 'origin', 'type', 'size', 'duplicate', 'pages', 'figures', 'tables', 'note')
         self.tree = ttk.Treeview(listing, columns=self.columns, show='headings', selectmode='extended')
-        titles = ['№', 'Файл', 'Текущая папка', 'Исходный путь / варианты', 'Тип', 'Байт', 'Дубль', 'Стр.', 'Рис.', 'Табл.', 'Метка', 'Примечание']
+        titles = ['№', 'Файл', 'Текущая папка', 'Исходный путь / варианты', 'Тип', 'Байт', 'Дубль', 'Стр.', 'Рис.', 'Табл.', 'Метка']
         self.titles = dict(zip(self.columns, titles))
-        for column, title, width in zip(self.columns, titles, [50, 220, 110, 240, 55, 90, 60, 65, 60, 60, 90, 180]):
+        for column, title, width in zip(self.columns, titles, [50, 220, 110, 240, 55, 90, 60, 65, 60, 60, 90]):
             self.tree.heading(column, text=title, command=lambda c=column: self.sort(c))
-            self.tree.column(column, width=width, minwidth=40, stretch=column in ('name', 'origin', 'error'),
+            self.tree.column(column, width=width, minwidth=40, stretch=column in ('name', 'origin'),
                              anchor='e' if column in ('number', 'size', 'pages', 'figures', 'tables') else 'w')
         self.tree.tag_configure('error', foreground='#9c3a16')
         ybar = ttk.Scrollbar(listing, command=self.tree.yview)
@@ -166,7 +166,10 @@ class App:
         now = time.monotonic()
         if count == 0 or now - self.last_tick > 1:
             self.last_tick = now
-            self.events.put(('snapshot', count, copy.deepcopy(self.session.state['documents'])))
+            if count == 0:
+                self.events.put(('snapshot', count, copy.deepcopy(self.session.state['documents'])))
+            else:
+                self.events.put(('progress', count))
 
     def stop(self):
         if self.busy and self.session:
@@ -177,6 +180,10 @@ class App:
         try:
             while True:
                 event = self.events.get_nowait()
+                if event[0] == 'progress':
+                    if not self.session.cancel.is_set():
+                        self.status.set(f'{self.operation}… обработано {event[1]}')
+                    continue
                 if event[0] == 'snapshot':
                     self.view_docs = event[2]
                     if not self.session.cancel.is_set():
@@ -185,7 +192,6 @@ class App:
                     continue
                 self.busy = False
                 self.progress.stop()
-                self.view_docs = copy.deepcopy(self.session.state['documents']) if self.session else []
                 self.refresh_controls()
                 self.refreshed()
                 if event[0] == 'error':
@@ -221,7 +227,7 @@ class App:
 
     def scan(self):
         if self.session and not self.busy:
-            self.run('Открытие / продолжение анализа', lambda: self.session.open_catalog(self.tick))
+            self.run('Обновление списка', lambda: self.session.open_catalog(self.tick))
 
     def refreshed(self):
         if not self.session:
@@ -230,7 +236,7 @@ class App:
         docs = self.view_docs
         pending = sum(not m['done'] for m in self.session.state['moves'])
         self.status.set(f"Файлов: {len(docs)} · SHA-256: {sum(bool(d.get('hash')) for d in docs)}/{len(docs)} · "
-                        f"Ошибок: {sum(bool(d.get('error')) for d in docs)}" +
+                        f"Ошибок: {sum(bool(d.get('error') or d.get('stats', {}).get('failed')) for d in docs)}" +
                         (' · БЭКАП: файлы не изменяются' if self.session.read_only else ' · Unlock автоматически') +
                         (f' · Не перенесено: {pending}' if pending else '') +
                         (' · Остановлено, прогресс сохранён' if self.session.cancel.is_set() else ''))
@@ -257,7 +263,7 @@ class App:
             if self.search.get().casefold() not in (d['path'] + ' ' + ' '.join(origins)).casefold():
                 continue
             f = self.filter.get()
-            if f == 'Точные дубли' and not d.get('duplicate') or f == 'Есть ошибки' and not d.get('error') or f == 'Скорее да' and not d.get('note'):
+            if f == 'Точные дубли' and not d.get('duplicate') or f == 'Есть ошибки' and not (d.get('error') or d.get('stats', {}).get('failed')) or f == 'Скорее да' and not d.get('note'):
                 continue
             stats = d.get('stats', {})
             def metric(name):
@@ -266,8 +272,8 @@ class App:
             self.tree.insert('', 'end', iid=d['path'], values=(number, Path(d['path']).name, str(Path(d['path']).parent),
                 ' | '.join(origins), Path(d['path']).suffix.lower() or '—', d.get('size') if d.get('size') is not None else '—',
                 f"#{d['duplicate']}" if d.get('duplicate') else ('?' if not d.get('hash') else '—'), metric('pages'),
-                metric('figures'), metric('tables'), d.get('note', ''), d.get('error') or stats.get('info', '')),
-                tags=('error',) if d.get('error') else ())
+                metric('figures'), metric('tables'), d.get('note', '')),
+                tags=('error',) if d.get('error') or stats.get('failed') else ())
         existing = [p for p in selected if self.tree.exists(p)]
         if existing:
             self.tree.selection_set(existing)
@@ -288,7 +294,8 @@ class App:
         if len(docs) == 1:
             d = docs[0]
             self.details.set(f"Путь: {self.session.root / d['path']}\nИсходные пути: {' | '.join(d.get('origins', [d['origin']]))}" +
-                             (' · ' + d['origin_match'] if d.get('origin_match') else ''))
+                             (' · ' + d['origin_match'] if d.get('origin_match') else '') +
+                             ('\n' + (d.get('error') or d['stats']['info']) if d.get('error') or d.get('stats', {}).get('failed') else ''))
         else:
             self.details.set(f'Выделено: {len(docs)} · Ctrl/Shift — выбор · Ctrl+A — все видимые · Esc — снять выбор / стоп · Delete — корзина')
 
