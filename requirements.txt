@@ -1,0 +1,2 @@
+# Optional: enables PDF page counts. Folder tools and DOCX need only Python.
+pypdf>=6,<7

@@ -8,23 +8,51 @@ from pathlib import Path
 import stat
 import tempfile
 from collections import Counter
-from zipfile import ZipFile
-from xml.etree import ElementTree
 
 
 def is_link(path: Path) -> bool:
-    info = path.lstat()
+    info = Path(native(path)).lstat()
     return stat.S_ISLNK(info.st_mode) or bool(
-        getattr(info, "st_file_attributes", 0) & 0x400
+        getattr(info, "st_reparse_tag", 0) & 0x20000000
     )
 
 
 def digest(path: Path) -> str:
     hasher = hashlib.sha256()
-    with path.open("rb") as stream:
+    with open(native(path), "rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             hasher.update(chunk)
     return hasher.hexdigest()
+
+
+def native(path):
+    """Extended Windows paths work even when LongPathsEnabled is disabled."""
+    value = os.path.abspath(path)
+    if os.name != "nt" or value.startswith("\\\\?\\"):
+        return value
+    return "\\\\?\\UNC\\" + value[2:] if value.startswith("\\\\") else "\\\\?\\" + value
+
+
+def failure(error):
+    code = getattr(error, "winerror", None) or getattr(error, "errno", None)
+    if isinstance(error, FileNotFoundError):
+        return "Файл уже перемещён или удалён в Explorer"
+    if code in (32, 33):
+        return "Файл занят: закройте его в редакторе или Preview и повторите"
+    if isinstance(error, PermissionError):
+        return "Нет доступа: проверьте права или закройте файл в другой программе"
+    if isinstance(error, FileExistsError):
+        return "Имя уже занято; существующий файл сохранён"
+    return f"Ошибка файловой системы (код {code or 'неизвестен'})"
+
+
+def move_exclusive(source, destination):
+    if os.name == "nt":
+        # Windows rename fails on an existing target and preserves ADS/metadata.
+        os.rename(native(source), native(destination))
+    else:
+        os.link(source, destination)
+        source.unlink()
 
 
 def atomic_json(path: Path, value: dict) -> None:
@@ -103,182 +131,203 @@ class Session:
             raise ValueError("Путь выходит за выбранный каталог.")
         return candidate
 
-    def scan(self, progress=lambda count: None):
-        if any(not m["done"] for m in self.state["moves"]):
-            raise ValueError("Есть незавершённый перенос. Продолжите его или нажмите «Сбросить план переноса» перед сканированием.")
-        old = {d["path"]: d for d in self.state["documents"]}
-        moved = {m["destination"]: m for m in self.state["moves"] if m["done"]}
-        documents, issues = [], []
-        def walk_error(error):
-            issues.append("Не удалось прочитать один из каталогов.")
-        for folder, dirs, files in os.walk(self.root, followlinks=False, onerror=walk_error):
+    def walk(self):
+        self.state["issues"] = []
+        def error(exc):
+            self.state["issues"].append(failure(exc))
+        for folder, dirs, files in os.walk(native(self.root), followlinks=False, onerror=error):
             kept = []
             for name in dirs:
                 try:
-                    if is_link(Path(folder) / name):
-                        issues.append("Пропущена ссылка или junction.")
-                    else:
+                    if not is_link(Path(folder) / name):
                         kept.append(name)
-                except OSError:
-                    issues.append("Недоступен подкаталог.")
+                except OSError as exc:
+                    error(exc)
             dirs[:] = sorted(kept)
             for name in sorted(files):
                 path = Path(folder) / name
-                relative = str(path.relative_to(self.root))
-                item = {"path": relative, "origin": relative, "size": 0, "hash": "", "score": 1,
-                        "category": "Не определено", "reviewed": False, "reason": "Требуется просмотр человеком."}
                 try:
-                    if is_link(path) or not path.is_file():
-                        issues.append("Пропущен файл-ссылка или специальный файл.")
-                        continue
-                    before = path.stat()
-                    item["hash"] = digest(path)
-                    after = path.stat()
-                    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
-                        raise OSError("changed")
-                    item["size"] = after.st_size
-                    previous = old.get(relative)
-                    movement = moved.get(relative)
-                    if movement and movement["hash"] == item["hash"]:
-                        item["origin"] = movement["origin"]
-                        previous = previous or old.get(movement["source"])
-                    if previous and previous["hash"] == item["hash"]:
-                        for field in ("origin", "score", "category", "reviewed"):
-                            item[field] = previous[field]
-                    if item["size"] == 0:
-                        item["reason"] = "Пустой файл: нет данных для корпуса. Рекомендация: 0."
-                        if not item["reviewed"]:
-                            item["score"] = 0
-                except OSError:
+                    if not is_link(path) and path.is_file():
+                        yield path, str(path.relative_to(Path(native(self.root))))
+                except OSError as exc:
+                    error(exc)
+
+    def scan(self, progress=lambda count: None):
+        old = {d["path"]: d for d in self.state["documents"]}
+        moved = {m["destination"]: m for m in self.state["moves"] if m["done"]}
+        documents = []
+        for path, relative in self.walk():
+            item = {"path": relative, "origin": relative, "size": None, "hash": "",
+                    "note": "", "error": "", "stats": {}}
+            previous = old.get(relative, {})
+            try:
+                before = path.stat()
+                item["size"] = before.st_size
+                item["identity"] = [before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns]
+                item["hash"] = digest(path)
+                after = path.stat()
+                if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
                     item["hash"] = ""
-                    item["reason"] = "Ошибка чтения или файл изменился; повторите сканирование."
-                documents.append(item)
-                progress(len(documents))
+                    item["error"] = "Файл изменился во время проверки дублей; F5 для обновления"
+            except OSError as exc:
+                item["error"] = failure(exc)
+            movement = moved.get(relative)
+            if movement and (movement.get("hash") == item["hash"] and item["hash"] or
+                             movement.get("identity") == item.get("identity") and item.get("identity")):
+                item["origin"] = movement["origin"]
+            unchanged = item["hash"] and previous.get("hash") == item["hash"]
+            if unchanged:
+                item["origin"] = previous.get("origin", item["origin"])
+                item["note"] = previous.get("note", "Скорее да" if previous.get("score") == 2 else "")
+                item["stats"] = previous.get("stats", {})
+            documents.append(item)
+            progress(len(documents))
         counts = Counter(d["hash"] for d in documents if d["hash"])
         groups = {h: i + 1 for i, h in enumerate(sorted(h for h, n in counts.items() if n > 1))}
         for item in documents:
             item["duplicate"] = groups.get(item["hash"], 0)
-            if item["duplicate"]:
-                item["reason"] += " Точная копия по SHA-256; выберите нужный экземпляр."
         self.state["documents"] = documents
-        self.state["issues"] = issues
         self.save()
         return documents
 
-    def decide(self, relative: str, score: int, category: str):
-        if score not in (0, 1, 2):
-            raise ValueError("Оценка должна быть 0, 1 или 2.")
-        document = next(d for d in self.state["documents"] if d["path"] == relative)
-        self.state["undo"].append({k: document[k] for k in ("path", "hash", "score", "category", "reviewed")})
-        document.update(score=score, category=category, reviewed=True)
+    def mark(self, relative):
+        item = next(d for d in self.state["documents"] if d["path"] == relative)
+        item["note"] = "" if item.get("note") else "Скорее да"
         self.save()
 
-    def undo(self):
-        while self.state["undo"]:
-            previous = self.state["undo"].pop()
-            document = next((d for d in self.state["documents"]
-                             if d["path"] == previous["path"] and d["hash"] == previous["hash"]), None)
-            if document:
-                document.update(previous)
-                self.save()
-                return True
-        self.save()
-        return False
-
-    def flatten(self):
-        # Persist intent before each filesystem mutation. Hard links provide an
-        # exclusive destination on the same filesystem without overwriting files.
+    def flatten(self, progress=lambda count: None):
         pending = [m for m in self.state["moves"] if not m["done"]]
         if not pending:
-            occupied = {p.name.casefold() for p in self.root.iterdir()}
+            # Explorer may have changed the folder since the last scan.
+            self.scan(progress)
+            occupied = {p.name.casefold() for p in Path(native(self.root)).iterdir()}
             for document in self.state["documents"]:
                 source = Path(document["path"])
                 if source.parent == Path("."):
                     continue
-                if not document["hash"]:
-                    raise ValueError("Сначала устраните ошибки чтения и повторите сканирование.")
                 name, number = source.name, 1
                 while name.casefold() in occupied:
                     name = f"{source.stem}__{number}{source.suffix}"
                     number += 1
                 occupied.add(name.casefold())
                 pending.append({"source": str(source), "destination": name, "origin": document["origin"],
-                                "hash": document["hash"], "done": False})
+                                "hash": document["hash"], "identity": document.get("identity"),
+                                "method": "rename", "done": False})
             self.state["moves"].extend(pending)
             self.save()
-        for move in pending:
-            source = self.safe_path(move["source"])
-            destination = self.safe_path(move["destination"])
-            if source.exists():
-                if digest(source) != move["hash"]:
-                    raise ValueError("Файл изменился после сканирования. Перенос остановлен; оригинал сохранён.")
-                if not destination.exists():
-                    os.link(source, destination)
-                elif not os.path.samefile(source, destination):
-                    raise ValueError("Место назначения занято другим файлом. Перенос остановлен без перезаписи.")
-                if digest(destination) != move["hash"]:
-                    raise ValueError("Проверка целостности не пройдена. Оригинал сохранён.")
-                source.unlink()
-            elif not destination.is_file() or digest(destination) != move["hash"]:
-                raise ValueError("Не удалось восстановить перенос. Проверьте файлы локально.")
-            move["done"] = True
-            for document in self.state["documents"]:
-                if document["path"] == move["source"]:
-                    document["path"] = move["destination"]
-            for decision in self.state["undo"]:
-                if decision["path"] == move["source"]:
-                    decision["path"] = move["destination"]
+        result = {"moved": 0, "errors": []}
+        for index, move in enumerate(pending):
+            try:
+                source = self.safe_path(move["source"])
+                destination = self.safe_path(move["destination"])
+                src, dst = Path(native(source)), Path(native(destination))
+                if src.exists():
+                    if move.get("method") != "rename":
+                        # Recover journals made by the first hard-link version.
+                        if digest(src) != move["hash"]:
+                            raise ValueError("Файл изменён; сбросьте незавершённый план в меню «Инструменты»")
+                        if dst.exists():
+                            if not os.path.samefile(src, dst):
+                                raise FileExistsError()
+                            src.unlink()
+                        else:
+                            move_exclusive(src, dst)
+                    else:
+                        before = src.stat()
+                        identity = [before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns]
+                        if move.get("identity") and identity != move["identity"]:
+                            raise ValueError("Файл изменён; сбросьте незавершённый план в меню «Инструменты»")
+                        move_exclusive(src, dst)
+                elif dst.is_file():
+                    info = dst.stat()
+                    identity = [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns]
+                    if not (move.get("identity") == identity or move.get("hash") and digest(dst) == move["hash"]):
+                        raise ValueError("Не удалось подтвердить файл после прерывания переноса")
+                else:
+                    raise FileNotFoundError()
+                move["done"] = True
+                move.pop("error", None)
+                for document in self.state["documents"]:
+                    if document["path"] == move["source"]:
+                        document["path"] = move["destination"]
+                        document["origin"] = move["origin"]
+                result["moved"] += 1
+            except (OSError, ValueError) as exc:
+                move["error"] = str(exc) if isinstance(exc, ValueError) else failure(exc)
+                result["errors"].append({"path": move["source"], "error": move["error"]})
+            # Storage errors must stop the operation; do not continue without journal.
             self.save()
+            progress(index + 1)
+        self.scan(progress)
+        return result
 
     def remove_empty_directories(self):
-        removed = 0
-        # top-down traversal first to prune junctions, then deepest-first rmdir.
         folders = []
-        for folder, dirs, _ in os.walk(self.root, followlinks=False):
-            dirs[:] = [d for d in dirs if not is_link(Path(folder) / d)]
-            folders.extend(Path(folder) / d for d in dirs)
+        errors = []
+        for folder, dirs, _ in os.walk(native(self.root), followlinks=False,
+                                       onerror=lambda exc: errors.append(failure(exc))):
+            kept = []
+            for name in dirs:
+                path = Path(folder) / name
+                try:
+                    if not is_link(path):
+                        kept.append(name)
+                        folders.append(path)
+                except OSError as exc:
+                    errors.append(failure(exc))
+            dirs[:] = kept
+        removed = 0
         for folder in reversed(folders):
             try:
-                self.safe_path(str(folder.relative_to(self.root))).rmdir()
+                folder.rmdir()
                 removed += 1
-            except OSError:
-                pass  # Nonempty or inaccessible directories are retained.
-        return removed
+            except OSError as exc:
+                if getattr(exc, "winerror", None) != 145 and exc.errno not in (39, 17):
+                    errors.append(failure(exc))
+        return {"removed": removed, "errors": errors}
 
     def cancel_pending(self):
-        """Revert only unfinished hard links, never completed movements."""
         for move in self.state["moves"]:
             if move["done"]:
                 continue
-            source = self.safe_path(move["source"])
-            destination = self.safe_path(move["destination"])
-            if not source.is_file():
-                raise ValueError("Сначала продолжите перенос: один из файлов уже находится только в корне.")
-            if destination.exists() and os.path.samefile(source, destination):
+            source = Path(native(self.safe_path(move["source"])))
+            destination = Path(native(self.safe_path(move["destination"])))
+            if not source.exists() and destination.exists():
+                raise ValueError("Сначала продолжите перенос: один из файлов уже находится только в корне")
+            if source.exists() and destination.exists() and os.path.samefile(source, destination):
                 destination.unlink()
         self.state["moves"] = [m for m in self.state["moves"] if m["done"]]
         self.save()
 
+    def unlock(self, progress=lambda count: None):
+        if os.name != "nt":
+            raise ValueError("Unlock доступен только в Windows")
+        result = {"unlocked": 0, "unchanged": 0, "errors": []}
+        for index, (path, relative) in enumerate(self.walk()):
+            try:
+                os.unlink(str(path) + ":Zone.Identifier")
+                result["unlocked"] += 1
+            except FileNotFoundError:
+                result["unchanged"] += 1
+            except OSError as exc:
+                result["errors"].append({"path": relative, "error": failure(exc)})
+            progress(index + 1)
+        result["errors"].extend({"path": "Каталог", "error": e} for e in self.state["issues"])
+        return result
 
-def preview(path: Path) -> str:
-    limit = 150_000
-    if path.suffix.lower() in {".txt", ".md", ".csv", ".tsv", ".json", ".log", ".html", ".xml"}:
-        raw = path.open("rb")
-        with raw:
-            content = raw.read(limit + 1)
-        try:
-            result = content[:limit].decode("utf-8-sig")
-        except UnicodeDecodeError:
-            result = content[:limit].decode("cp1251", errors="replace")
-        return result + ("\n[Показано начало файла]" if len(content) > limit else "")
-    if path.suffix.lower() == ".docx":
-        with ZipFile(path) as archive:
-            info = archive.getinfo("word/document.xml")
-            if info.file_size > 10_000_000:
-                return "Документ слишком большой для встроенного просмотра."
-            tree = ElementTree.fromstring(archive.read(info))
-        ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
-        result = "\n".join("".join(t.text or "" for t in p.iter(ns + "t")) for p in tree.iter(ns + "p"))
-        return "Текст DOCX: без изображений, колонтитулов и точной вёрстки.\n\n" + result[:limit] + (
-            "\n[Показано начало текста]" if len(result) > limit else "")
-    return "Встроенный просмотр: TXT и DOCX. PDF, сканы и остальные форматы откройте кнопкой «Открыть документ». Отсутствие предпросмотра не означает бесполезность."
+    def collect_stats(self, progress=lambda count: None, use_word=False):
+        from .statistics import document_stats, word_stats
+        self.scan(progress)
+        for index, document in enumerate(self.state["documents"]):
+            path = self.safe_path(document["path"])
+            try:
+                before = Path(native(path)).stat()
+                result = word_stats(path) if use_word and path.suffix.lower() in (".doc", ".docx") else document_stats(path)
+                after = Path(native(path)).stat()
+                if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+                    result = {"info": "Файл изменился во время подсчёта; повторите"}
+                document["stats"] = result
+            except Exception:
+                document["stats"] = {"info": "Не удалось посчитать: файл недоступен, повреждён или защищён"}
+            progress(index + 1)
+        self.save()

@@ -1,14 +1,13 @@
-"""Run with python -m corpuspick."""
-import csv
+"""A small folder workbench used alongside Windows Explorer."""
 import os
 from pathlib import Path
 import queue
+import subprocess
 import threading
-from concurrent.futures import ThreadPoolExecutor
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from .core import Session, preview
+from .core import Session, failure
 
 
 class App:
@@ -16,113 +15,127 @@ class App:
         self.window, self.session = window, None
         self.events = queue.Queue()
         self.busy = False
-        self.preview_token = 0
-        self.preview_executor = ThreadPoolExecutor(max_workers=1)
-        self.preview_future = None
-        window.title("CorpusPick — подготовка корпуса")
-        window.geometry("1250x800")
-        window.minsize(900, 600)
-        self.status = tk.StringVar(value="Откройте отдельную рабочую копию каталога с документами.")
-        self.search = tk.StringVar()
-        self.filter = tk.StringVar(value="Все")
-        self.category = tk.StringVar(value="Не определено")
-        bar = ttk.Frame(window, padding=8)
-        bar.pack(fill="x")
+        self.operation = ''
+        self.sort_column, self.sort_reverse = 'name', False
+        self.search, self.filter = tk.StringVar(), tk.StringVar(value='Все файлы')
+        self.status = tk.StringVar(value='Откройте рабочий каталог. Просмотр и сортировка документов — в Explorer.')
+        self.details = tk.StringVar(value='F5 — обновить · Enter или двойной щелчок — показать файл в Проводнике')
+        window.title('CorpusPick — каталоги и состав документов')
+        window.geometry('1120x700')
+        window.minsize(720, 420)
+        window.rowconfigure(2, weight=1)
+        window.columnconfigure(0, weight=1)
+        menu = tk.Menu(window)
+        self.tools_menu = tk.Menu(menu, tearoff=False)
+        menu.add_cascade(label='Инструменты', menu=self.tools_menu)
+        for title, command in [('Unlock — разблокировать все вложенные файлы…', self.unlock),
+                               ('Подсчитать состав DOCX / страницы PDF', self.statistics),
+                               ('Подсчитать через Word (DOC / DOCX)…', lambda: self.statistics(True)),
+                               ('Обновить список     F5', self.scan),
+                               ('Сбросить незавершённый план переноса', self.reset_plan)]:
+            self.tools_menu.add_command(label=title, command=command)
+        window.configure(menu=menu)
+        bar = ttk.Frame(window, padding=(10, 10, 10, 5))
+        bar.grid(row=0, column=0, sticky='ew')
         self.buttons = []
-        for label, command in [("Открыть каталог", self.open_folder), ("Обновить", self.scan),
-                               ("Перенести в корень", self.flatten), ("Удалить пустые папки", self.clean),
-                               ("Сбросить план переноса", self.cancel_pending), ("Экспорт CSV", self.export)]:
-            button = ttk.Button(bar, text=label, command=command)
-            button.pack(side="left", padx=3)
+        for title, command in [('Открыть каталог', self.open_folder), ('Перенести в корень', self.flatten),
+                               ('Удалить пустые папки', self.clean)]:
+            button = ttk.Button(bar, text=title, command=command)
+            button.pack(side='left', padx=(0, 8))
             self.buttons.append(button)
-        ttk.Label(window, textvariable=self.status, padding=8, wraplength=1150).pack(fill="x")
-        filters = ttk.Frame(window, padding=8)
-        filters.pack(fill="x")
-        ttk.Label(filters, text="Поиск по пути:").pack(side="left")
-        ttk.Entry(filters, textvariable=self.search, width=40).pack(side="left", padx=8)
-        ttk.Combobox(filters, textvariable=self.filter, state="readonly", width=22,
-                     values=["Все", "Точные дубли", "Непроверенные", "Оценка 0", "Оценка 1", "Оценка 2"]).pack(side="left")
-        self.search.trace_add("write", lambda *_: self.render())
-        self.filter.trace_add("write", lambda *_: self.render())
-        panes = ttk.Panedwindow(window, orient="vertical")
-        panes.pack(fill="both", expand=True, padx=8)
-        listing = ttk.Frame(panes)
-        columns = ("name", "origin", "type", "size", "duplicate", "score", "category", "reviewed")
-        self.tree = ttk.Treeview(listing, columns=columns, show="headings", selectmode="browse")
-        for column, title, width in zip(columns,
-                ["Файл", "Исходный путь", "Тип", "Байт", "Дубль: группа", "0/1/2", "Категория", "Проверен"],
-                [220, 300, 65, 90, 100, 60, 120, 80]):
-            self.tree.heading(column, text=title, command=lambda c=column: self.sort(c))
-            self.tree.column(column, width=width)
-        yscroll = ttk.Scrollbar(listing, command=self.tree.yview)
-        xscroll = ttk.Scrollbar(listing, orient="horizontal", command=self.tree.xview)
-        self.tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        yscroll.grid(row=0, column=1, sticky="ns")
-        xscroll.grid(row=1, column=0, sticky="ew")
-        listing.rowconfigure(0, weight=1)
+        filters = ttk.Frame(window, padding=(10, 5))
+        filters.grid(row=1, column=0, sticky='ew')
+        filters.columnconfigure(1, weight=1)
+        ttk.Label(filters, text='Найти:').grid(row=0, column=0, padx=(0, 8))
+        ttk.Entry(filters, textvariable=self.search).grid(row=0, column=1, sticky='ew')
+        ttk.Combobox(filters, textvariable=self.filter, state='readonly', width=19,
+                     values=['Все файлы', 'Точные дубли', 'Есть ошибки', 'Скорее да']).grid(row=0, column=2, padx=(8, 0))
+        listing = ttk.Frame(window, padding=(10, 0))
+        listing.grid(row=2, column=0, sticky='nsew')
         listing.columnconfigure(0, weight=1)
-        panes.add(listing, weight=3)
-        details = ttk.Frame(panes)
-        self.info = tk.StringVar(value="Оценка: 0 — исключить; 1 — ручная проверка; 2 — полезен для выбранной задачи.")
-        ttk.Label(details, textvariable=self.info, wraplength=1150, padding=5).pack(fill="x")
-        actions = ttk.Frame(details)
-        actions.pack(fill="x", pady=5)
-        ttk.Label(actions, text="Категория:").pack(side="left")
-        ttk.Combobox(actions, textvariable=self.category, width=20, state="readonly",
-                     values=["Не определено", "Отчёт", "Письмо", "Таблица", "Взять под OCR", "Другое"]).pack(side="left", padx=5)
-        for score, label in [(0, "0 — исключить"), (1, "1 — проверить"), (2, "2 — полезен")]:
-            ttk.Button(actions, text=label, command=lambda s=score: self.decide(s)).pack(side="left", padx=3)
-        ttk.Button(actions, text="Отменить оценку", command=self.undo).pack(side="left", padx=3)
-        ttk.Button(actions, text="Открыть документ", command=self.open_document).pack(side="left", padx=3)
-        self.text = tk.Text(details, wrap="word", state="disabled", font=("Segoe UI", 11))
-        scroll = ttk.Scrollbar(details, command=self.text.yview)
-        self.text.configure(yscrollcommand=scroll.set)
-        scroll.pack(side="right", fill="y")
-        self.text.pack(fill="both", expand=True)
-        panes.add(details, weight=2)
-        ttk.Label(window, text="Оценки сохраняются автоматически. 0/1/2 в списке — оценить и перейти дальше; Ctrl+Z — отмена. "
-                  "SHA-256 находит только побайтовые копии, не версии DOCX/PDF.", padding=8, wraplength=1150).pack(fill="x")
-        self.tree.bind("<<TreeviewSelect>>", self.select)
-        for score in (0, 1, 2):
-            self.tree.bind(str(score), lambda event, s=score: self.decide(s))
-        self.tree.bind("<Control-z>", lambda event: self.undo())
-        self.tree.bind("<Double-1>", lambda event: self.open_document())
-        window.protocol("WM_DELETE_WINDOW", self.close)
+        listing.rowconfigure(0, weight=1)
+        self.columns = ('name', 'folder', 'type', 'size', 'duplicate', 'note', 'pages', 'figures', 'tables', 'appendices', 'error')
+        self.tree = ttk.Treeview(listing, columns=self.columns, show='headings', selectmode='browse')
+        for column, title, width in zip(self.columns,
+            ['Файл', 'Папка', 'Тип', 'Байт', 'Дубль', 'Метка', 'Страниц', 'Рисунков', 'Таблиц', 'Приложений ≈', 'Примечание'],
+            [250, 160, 60, 85, 65, 85, 75, 80, 75, 105, 180]):
+            self.tree.heading(column, text=title, command=lambda c=column: self.sort(c))
+            self.tree.column(column, width=width, minwidth=50, stretch=column in ('name', 'folder', 'error'),
+                             anchor='e' if column in ('size', 'pages', 'figures', 'tables', 'appendices') else 'w')
+        self.tree.tag_configure('error', foreground='#9c3a16')
+        ybar = ttk.Scrollbar(listing, command=self.tree.yview)
+        xbar = ttk.Scrollbar(listing, orient='horizontal', command=self.tree.xview)
+        self.tree.configure(yscrollcommand=ybar.set, xscrollcommand=xbar.set)
+        self.tree.grid(row=0, column=0, sticky='nsew')
+        ybar.grid(row=0, column=1, sticky='ns')
+        xbar.grid(row=1, column=0, sticky='ew')
+        self.progress = ttk.Progressbar(window, mode='indeterminate')
+        self.progress.grid(row=3, column=0, sticky='ew', padx=10, pady=(6, 0))
+        self.status_label = ttk.Label(window, textvariable=self.status, padding=(10, 5), wraplength=1000)
+        self.status_label.grid(row=4, column=0, sticky='ew')
+        self.detail_label = ttk.Label(window, textvariable=self.details, padding=(10, 0, 10, 10), wraplength=1000)
+        self.detail_label.grid(row=5, column=0, sticky='ew')
+        def resize(event):
+            width = max(500, window.winfo_width() - 30)
+            self.detail_label.configure(wraplength=width)
+            self.status_label.configure(wraplength=width)
+        window.bind('<Configure>', resize)
+        self.context = tk.Menu(window, tearoff=False)
+        self.context.add_command(label='Показать в Проводнике', command=self.show_in_explorer)
+        self.context.add_command(label='Копировать путь', command=self.copy_path)
+        self.context.add_separator()
+        self.context.add_command(label='Скорее да — поставить / снять     2', command=self.mark)
+        self.tree.bind('<Button-3>', self.popup)
+        self.tree.bind('<<TreeviewSelect>>', self.select)
+        self.tree.bind('<Double-1>', lambda _: self.show_in_explorer())
+        self.tree.bind('<Return>', lambda _: self.show_in_explorer())
+        self.tree.bind('2', lambda _: self.mark())
+        window.bind('<F5>', lambda _: self.scan())
+        self.search.trace_add('write', lambda *_: self.render())
+        self.filter.trace_add('write', lambda *_: self.render())
+        window.protocol('WM_DELETE_WINDOW', self.close)
+        self.refresh_controls()
         window.after(100, self.poll)
 
-    def run(self, function, done):
+    def refresh_controls(self):
+        for i, button in enumerate(self.buttons):
+            button.configure(state='disabled' if self.busy or (i and not self.session) else 'normal')
+        for i in range(self.tools_menu.index('end') + 1):
+            self.tools_menu.entryconfigure(i, state='normal' if self.session and not self.busy else 'disabled')
+
+    def run(self, label, function, done=None):
         if self.busy:
             return
-        self.busy = True
-        self.status.set("Выполняется локальная операция…")
-        for button in self.buttons:
-            button.configure(state="disabled")
+        self.busy, self.operation = True, label
+        self.status.set(label + '…')
+        self.refresh_controls()
+        self.progress.start(12)
         def worker():
             try:
-                self.events.put(("done", done, function()))
-            except Exception as error:
-                # OSError may contain private paths: display only a generic message.
-                reason = str(error) if isinstance(error, ValueError) else "Операция не завершена. Проверьте доступ, свободное место и формат файлов."
-                self.events.put(("error", reason))
+                self.events.put(('done', done, function()))
+            except Exception as exc:
+                reason = str(exc) if isinstance(exc, ValueError) else failure(exc)
+                self.events.put(('error', reason))
         threading.Thread(target=worker, daemon=True).start()
+
+    def tick(self, count):
+        if count % 20 == 0:
+            self.events.put(('progress', count))
 
     def poll(self):
         try:
             while True:
                 event = self.events.get_nowait()
-                if event[0] == "preview":
-                    if event[1] == self.preview_token:
-                        self.set_text(event[2])
+                if event[0] == 'progress':
+                    self.status.set(f'{self.operation}… обработано {event[1]}')
                     continue
                 self.busy = False
-                for button in self.buttons:
-                    button.configure(state="normal")
-                if event[0] == "error":
-                    self.status.set("Операция остановлена. Журнал сохранён; перенос можно продолжить той же кнопкой.")
-                    messagebox.showerror("CorpusPick", event[1])
-                    self.render()
-                else:
+                self.progress.stop()
+                self.refresh_controls()
+                self.refreshed()
+                if event[0] == 'error':
+                    messagebox.showerror('Операция остановлена', event[1])
+                elif event[1]:
                     event[1](event[2])
         except queue.Empty:
             pass
@@ -131,7 +144,7 @@ class App:
     def open_folder(self):
         if self.busy:
             return
-        chosen = filedialog.askdirectory(title="Выберите рабочую копию каталога")
+        chosen = filedialog.askdirectory(title='Рабочий каталог документов')
         if not chosen:
             return
         if self.session and self.session.root == Path(chosen).resolve():
@@ -139,191 +152,169 @@ class App:
             return
         try:
             session = Session(Path(chosen))
-        except Exception:
-            messagebox.showerror("Не удалось открыть", "Проверьте права, состояние сессии и не открыт ли каталог в другом окне.")
+        except Exception as exc:
+            messagebox.showerror('Не удалось открыть каталог', str(exc) if isinstance(exc, ValueError) else failure(exc))
             return
         if self.session:
             self.session.close()
         self.session = session
-        self.preview_token += 1
-        self.set_text("")
-        self.window.title(f"CorpusPick — {chosen}")
+        self.window.title(f'CorpusPick — {chosen}')
         self.scan()
 
     def scan(self):
-        if self.session:
-            if any(not m["done"] for m in self.session.state["moves"]):
-                self.refreshed()
-                messagebox.showinfo("Незавершённый перенос", "Нажмите «Перенести в корень» для продолжения или «Сбросить план переноса» для отмены оставшихся шагов.")
-                return
-            self.run(self.session.scan, lambda _: self.refreshed())
+        if self.session and not self.busy:
+            self.run('Обновление списка и проверка дублей', lambda: self.session.scan(self.tick))
 
     def refreshed(self):
-        docs = self.session.state["documents"]
-        hashes = [d["hash"] for d in docs if d["hash"]]
-        groups = len({d["duplicate"] for d in docs if d["duplicate"]})
-        scores = " / ".join(f"{s}: {sum(d['score'] == s for d in docs)}" for s in (0, 1, 2))
-        pending = sum(not m["done"] for m in self.session.state["moves"])
-        self.status.set(f"Файлов: {len(docs)} · {sum(d['size'] for d in docs)/1024/1024:.1f} МБ · "
-                        f"Групп дублей: {groups}, лишних копий: {len(hashes)-len(set(hashes))} · "
-                        f"Оценки {scores} · Ошибок чтения: {sum(not d['hash'] for d in docs)} · "
-                        f"Пропусков/предупреждений: {len(self.session.state.get('issues', []))} · Переносов в ожидании: {pending}")
+        if not self.session:
+            return
+        docs = self.session.state['documents']
+        hashes = [d['hash'] for d in docs if d.get('hash')]
+        errors = sum(bool(d.get('error')) for d in docs)
+        pending = sum(not m['done'] for m in self.session.state['moves'])
+        self.status.set(f"Файлов: {len(docs)} · {sum(d.get('size') or 0 for d in docs)/1024/1024:.1f} МБ · "
+                        f"Лишних точных копий: {len(hashes)-len(set(hashes))} · Ошибок: {errors} · "
+                        f"Недоступных каталогов: {len(self.session.state.get('issues', []))}" +
+                        (f' · Не перенесено: {pending} (повторите перенос)' if pending else ''))
+        totals = []
+        for field, label in [('pages', 'Страниц'), ('figures', 'Рисунков'), ('tables', 'Таблиц'), ('appendices', 'Приложений')]:
+            known = [d['stats'] for d in docs if d.get('stats', {}).get(field) is not None]
+            if known:
+                prefix = '≈' if any(s.get(field + '_estimated') for s in known) else ''
+                totals.append(f"{label}: {prefix}{sum(s[field] for s in known)} ({len(known)} файлов)")
+        if totals:
+            self.status.set(self.status.get() + '\n' + ' · '.join(totals))
         self.render()
 
     def render(self):
         if not self.session or self.busy:
             return
-        selected = self.tree.selection()
+        current = self.selected()
+        selected_path = current['path'] if current else None
         self.tree.delete(*self.tree.get_children())
-        for i, d in enumerate(self.session.state["documents"]):
-            if self.search.get().casefold() not in (d["path"] + " " + d["origin"]).casefold():
-                continue
+        docs = self.session.state['documents']
+        has_stats = any(d.get('stats') for d in docs)
+        self.tree.configure(displaycolumns=self.columns if has_stats else tuple(c for c in self.columns if c not in ('pages', 'figures', 'tables', 'appendices')))
+        def key(d):
+            c = self.sort_column
+            if c in ('pages', 'figures', 'tables', 'appendices'):
+                return d.get('stats', {}).get(c) if d.get('stats', {}).get(c) is not None else -1
+            if c in ('size', 'duplicate'):
+                return d.get(c) or 0
+            return {'name': Path(d['path']).name, 'folder': str(Path(d['path']).parent),
+                    'type': Path(d['path']).suffix}.get(c, d.get(c, '')).casefold()
+        for d in sorted(docs, key=key, reverse=self.sort_reverse):
             choice = self.filter.get()
-            if choice == "Точные дубли" and not d.get("duplicate"):
+            if self.search.get().casefold() not in (d['path'] + ' ' + d['origin']).casefold():
                 continue
-            if choice == "Непроверенные" and d["reviewed"]:
+            if choice == 'Точные дубли' and not d.get('duplicate') or choice == 'Есть ошибки' and not d.get('error') or choice == 'Скорее да' and not d.get('note'):
                 continue
-            if choice.startswith("Оценка") and d["score"] != int(choice[-1]):
-                continue
-            self.tree.insert("", "end", iid=str(i), values=(d["path"], d["origin"], Path(d["path"]).suffix,
-                             d["size"], d.get("duplicate") or "—", d["score"], d["category"], "Да" if d["reviewed"] else "Нет"))
-        if selected and self.tree.exists(selected[0]):
-            self.tree.selection_set(selected[0])
+            stats = d.get('stats', {})
+            def metric(name):
+                value = stats.get(name)
+                return '—' if value is None else ('≈' if stats.get(name + '_estimated') else '') + str(value)
+            self.tree.insert('', 'end', iid=d['path'], values=(Path(d['path']).name, str(Path(d['path']).parent),
+                Path(d['path']).suffix.lower() or '—', d.get('size') if d.get('size') is not None else '—',
+                f"#{d['duplicate']}" if d.get('duplicate') else ('?' if not d.get('hash') else '—'), d.get('note', ''),
+                metric('pages'), metric('figures'), metric('tables'), metric('appendices'), d.get('error', '') or stats.get('info', '')),
+                tags=('error',) if d.get('error') else ())
+        if selected_path and self.tree.exists(selected_path):
+            self.tree.selection_set(selected_path)
         else:
-            self.preview_token += 1
-            self.set_text("")
-            self.info.set("Выберите документ для просмотра и оценки.")
-
-    def sort(self, column):
-        rows = list(self.tree.get_children())
-        def key(row):
-            value = self.tree.set(row, column)
-            return int(value) if column in ("size", "score") else value.casefold()
-        for index, row in enumerate(sorted(rows, key=key)):
-            self.tree.move(row, "", index)
+            self.details.set('F5 — обновить после сортировки в Explorer · Двойной щелчок — показать в Проводнике · 2 — метка «Скорее да»')
 
     def selected(self):
         selection = self.tree.selection()
         if self.session and selection:
-            return self.session.state["documents"][int(selection[0])]
-
-    def set_text(self, content):
-        self.text.configure(state="normal")
-        self.text.delete("1.0", "end")
-        self.text.insert("1.0", content)
-        self.text.configure(state="disabled")
+            return next((d for d in self.session.state['documents'] if d['path'] == selection[0]), None)
 
     def select(self, _=None):
-        if self.busy:
-            return
         d = self.selected()
-        if not d:
-            return
-        self.category.set(d["category"])
-        self.info.set(f"Был: {d['origin']}\n{d['reason']} "
-                      "Оценка 2 — ваше решение о пользе; документ ещё не является готовым обучающим примером.")
-        self.preview_token += 1
-        token = self.preview_token
-        session, relative = self.session, d["path"]
-        self.set_text("Загрузка…")
-        def worker():
-            try:
-                content = preview(session.safe_path(relative))
-            except Exception:
-                content = "Не удалось прочитать предпросмотр. Проверьте документ локально."
-            self.events.put(("preview", token, content))
-        if self.preview_future:
-            self.preview_future.cancel()
-        self.preview_future = self.preview_executor.submit(worker)
+        if d:
+            self.details.set(f"Путь: {self.session.root / d['path']}\nБыл: {d['origin']}" +
+                             ('\n' + (d.get('error') or d.get('stats', {}).get('info', '')) if d.get('error') or d.get('stats') else ''))
 
-    def decide(self, score):
-        if self.busy or not self.selected():
-            return
-        current = self.tree.selection()[0]
-        following = self.tree.next(current)
-        try:
-            self.session.decide(self.selected()["path"], score, self.category.get())
-        except OSError:
-            messagebox.showerror("Ошибка сохранения", "Не удалось сохранить оценку. Проверьте каталог состояния.")
-            return
-        self.refreshed()
-        if following and self.tree.exists(following):
-            self.tree.selection_set(following)
-            self.tree.see(following)
-        self.tree.focus_set()
+    def sort(self, column):
+        self.sort_reverse = not self.sort_reverse if self.sort_column == column else False
+        self.sort_column = column
+        self.render()
 
-    def undo(self):
-        if self.session and not self.busy:
+    def popup(self, event):
+        row = self.tree.identify_row(event.y)
+        if row and not self.busy:
+            self.tree.selection_set(row)
+            self.context.tk_popup(event.x_root, event.y_root)
+
+    def mark(self):
+        if self.selected() and not self.busy:
             try:
-                self.session.undo()
-                self.refreshed()
-            except OSError:
-                messagebox.showerror("Ошибка сохранения", "Не удалось сохранить отмену.")
+                self.session.mark(self.selected()['path'])
+                self.render()
+            except OSError as exc:
+                messagebox.showerror('Не удалось сохранить метку', failure(exc))
+
+    def show_in_explorer(self):
+        if self.selected() and not self.busy and os.name == 'nt':
+            try:
+                path = self.session.safe_path(self.selected()['path'])
+                subprocess.Popen(['explorer.exe', f'/select,{path}'])
+            except (OSError, ValueError) as exc:
+                messagebox.showerror('Проводник', failure(exc))
+
+    def copy_path(self):
+        if self.selected():
+            self.window.clipboard_clear()
+            self.window.clipboard_append(str(self.session.root / self.selected()['path']))
+
+    def result(self, title, summary, errors):
+        if errors:
+            lines = [f"{e['path']}: {e['error']}" if isinstance(e, dict) else e for e in errors[:10]]
+            summary += '\n\n' + '\n'.join(lines) + (f'\nЕщё ошибок: {len(errors)-10}' if len(errors) > 10 else '')
+        messagebox.showinfo(title, summary)
 
     def flatten(self):
-        if not self.session or self.busy:
-            return
-        if messagebox.askyesno("Перенос файлов", "Все просканированные файлы из подпапок будут перенесены в корень выбранного каталога. "
-                               "Совпадающие имена получат суффикс. Автоматической отмены переноса нет. "
-                               "Используйте отдельную копию архива и закройте документы в редакторах. Продолжить?"):
-            def operation():
-                self.session.flatten()
-                self.session.scan()
-            self.run(operation, lambda _: self.refreshed())
+        if self.session and not self.busy and messagebox.askyesno('Перенести в корень',
+            'Перенести все файлы из вложенных папок в корень текущего каталога? Совпадающие имена получат суффикс. '
+            'Недоступные файлы останутся на месте. Фильтр списка не ограничивает перенос.'):
+            self.run('Перенос файлов', lambda: self.session.flatten(self.tick),
+                     lambda r: self.result('Перенос', f"Перенесено: {r['moved']}. Не перенесено: {len(r['errors'])}.", r['errors']))
 
     def clean(self):
-        if self.session and not self.busy and messagebox.askyesno("Пустые папки", "Удалить только пустые подкаталоги выбранного корня?"):
-            self.run(self.session.remove_empty_directories,
-                     lambda count: messagebox.showinfo("Готово", f"Удалено пустых папок: {count}") or self.refreshed())
+        if self.session and not self.busy:
+            self.run('Удаление пустых папок', self.session.remove_empty_directories,
+                     lambda r: self.result('Пустые папки', f"Удалено: {r['removed']}. Непустые папки сохранены.", r['errors']))
 
-    def cancel_pending(self):
+    def unlock(self):
+        if self.session and not self.busy and messagebox.askyesno('Unlock',
+            'Снять отметку «скачано из интернета» со всех файлов в каталоге и подпапках? '
+            'Это разрешает их обычное открытие/предпросмотр Windows. Применяйте к файлам, которым доверяете. '
+            'Права доступа, пароли и занятость файла другой программой не меняются.'):
+            self.run('Unlock', lambda: self.session.unlock(self.tick),
+                     lambda r: self.result('Unlock', f"Разблокировано: {r['unlocked']}. Без отметки: {r['unchanged']}.", r['errors']))
+
+    def statistics(self, use_word=False):
+        if not self.session or self.busy:
+            return
+        if use_word and not messagebox.askyesno('Подсчёт через Word',
+            'Открыть DOC/DOCX в отдельном скрытом Word только для чтения и пересчитать страницы, рисунки и таблицы? '
+            'Макросы и обновление ссылок отключаются, документы не сохраняются. Нужен установленный Word; '
+            'его подключённые службы зависят от настроек Office. До 120 секунд на файл.'):
+            return
+        self.run('Подсчёт состава документов', lambda: self.session.collect_stats(self.tick, use_word))
+
+    def reset_plan(self):
         if self.session and not self.busy:
             def operation():
                 self.session.cancel_pending()
-                self.session.scan()
-            self.run(operation, lambda _: self.refreshed())
-
-    def open_document(self):
-        if self.busy or not self.selected():
-            return
-        path = self.session.safe_path(self.selected()["path"])
-        if path.suffix.lower() not in {".pdf", ".docx", ".doc", ".odt", ".rtf", ".txt", ".xlsx", ".xls", ".csv", ".png", ".jpg", ".jpeg", ".tif", ".tiff"}:
-            messagebox.showinfo("Формат", "Для этого типа файлов запуск из приложения отключён.")
-            return
-        if messagebox.askyesno("Внешний просмотрщик", "Открыть файл в системной программе? Её сетевые подключения и макросы управляются её собственными настройками."):
-            try:
-                os.startfile(path)
-            except (OSError, AttributeError):
-                messagebox.showerror("Не удалось открыть", "Нет доступной программы для этого формата.")
-
-    def export(self):
-        if not self.session or self.busy:
-            return
-        filename = filedialog.asksaveasfilename(title="Локальный отчёт (содержит имена и пути)",
-                                               defaultextension=".csv", filetypes=[("CSV", "*.csv")])
-        if not filename:
-            return
-        def operation():
-            # Exclusive creation protects documents and previously exported reports.
-            with open(filename, "x", encoding="utf-8-sig", newline="") as stream:
-                fields = ["path", "origin", "size", "hash", "duplicate", "score", "category", "reviewed", "reason"]
-                writer = csv.DictWriter(stream, fields, delimiter=";")
-                writer.writeheader()
-                for doc in self.session.state["documents"]:
-                    row = {key: doc.get(key, "") for key in fields}
-                    for key, value in row.items():
-                        if isinstance(value, str) and value.lstrip().startswith(("=", "+", "-", "@")):
-                            row[key] = "'" + value
-                    writer.writerow(row)
-        self.run(operation, lambda _: self.refreshed())
+                self.session.scan(self.tick)
+            self.run('Сброс оставшегося плана', operation)
 
     def close(self):
         if self.busy:
-            messagebox.showinfo("Операция выполняется", "Дождитесь завершения операции перед закрытием.")
+            messagebox.showinfo('Операция выполняется', 'Дождитесь завершения операции перед закрытием.')
             return
         if self.session:
             self.session.close()
-        self.preview_executor.shutdown(wait=False, cancel_futures=True)
         self.window.destroy()
 
 
@@ -333,5 +324,5 @@ def main():
     window.mainloop()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
