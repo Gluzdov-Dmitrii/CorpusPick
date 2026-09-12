@@ -32,7 +32,7 @@ class GuiSmokeTest(unittest.TestCase):
                 app.session = Session(root, Path(directory) / 'state')
                 app.scan()
                 settle()
-                self.assertEqual(len(app.buttons), 3)
+                self.assertEqual(len(app.buttons), 4)
                 self.assertEqual(len(app.tree.get_children()), 1)
                 self.assertFalse(hasattr(app, 'text'))
                 app.tree.selection_set(str(Path('nested/demo.txt')))
@@ -43,10 +43,18 @@ class GuiSmokeTest(unittest.TestCase):
                     settle()
                 self.assertTrue((root / 'demo.txt').exists())
                 self.assertEqual(len(app.tree.get_children()), 1)
-                (root / 'demo.txt').unlink()  # User sorts it out using Explorer.
-                app.scan()
-                settle()
+                app.session.state['documents'][0]['stats'] = {'pages': 5, 'tables': 2}
+                app.refreshed()
+                self.assertIn('Страниц: 5', app.totals.get())
+                app.search.set('no-match')
+                self.assertIn('Страниц: 5', app.totals.get())
+                app.search.set('')
+                app.tree.selection_set('demo.txt')
+                with patch('corpuspick.__main__.messagebox.askyesno', return_value=True), patch('corpuspick.core.recycle_file', side_effect=lambda path: path.rename(Path(directory) / 'fake-trash.txt')):
+                    app.delete_selected()
+                    settle()
                 self.assertFalse(app.tree.get_children())
+                self.assertIn('Файлов: 0', app.totals.get())
                 app.session.close()
                 app.session = None
         finally:

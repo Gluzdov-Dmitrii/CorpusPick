@@ -8,6 +8,7 @@ from pathlib import Path
 import stat
 import tempfile
 from collections import Counter
+from .recycle import recycle_file
 
 
 def is_link(path: Path) -> bool:
@@ -194,6 +195,51 @@ class Session:
         item = next(d for d in self.state["documents"] if d["path"] == relative)
         item["note"] = "" if item.get("note") else "Скорее да"
         self.save()
+
+    def duplicate_plan(self, progress=lambda count: None):
+        self.scan(progress)
+        groups = {}
+        for document in self.state['documents']:
+            if document.get('hash') and not document.get('error'):
+                groups.setdefault(document['hash'], []).append(document)
+        plan = []
+        for documents in groups.values():
+            ordered = sorted(documents, key=lambda d: (not bool(d.get('note')),
+                             len(Path(d['path']).parts), d['path'].casefold(), d['path']))
+            plan.extend({'keep': dict(ordered[0]), 'remove': dict(d)} for d in ordered[1:])
+        return plan
+
+    def checked_document(self, document, verify_hash=False):
+        path = Path(native(self.safe_path(document['path'])))
+        info = path.stat()
+        identity = [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns]
+        if not path.is_file() or not document.get('identity') or identity != document['identity']:
+            raise ValueError('Файл изменился после обновления списка; нажмите F5 и повторите')
+        if verify_hash and (not document.get('hash') or digest(path) != document['hash']):
+            raise ValueError('Содержимое изменилось: удаление дубля отменено')
+        return self.safe_path(document['path'])
+
+    def trash_documents(self, documents=None, duplicate_plan=None, progress=lambda count: None):
+        if any(not m['done'] for m in self.state['moves']):
+            raise ValueError('Сначала завершите перенос или сбросьте его план в меню «Инструменты»')
+        result = {'trashed': 0, 'errors': []}
+        entries = duplicate_plan if duplicate_plan is not None else [{'remove': d} for d in documents or []]
+        for index, entry in enumerate(entries):
+            document = entry['remove']
+            try:
+                if 'keep' in entry:
+                    if entry['keep']['path'] == document['path'] or entry['keep'].get('hash') != document.get('hash'):
+                        raise ValueError('Некорректный план дублей: файл сохранён')
+                    self.checked_document(entry['keep'], verify_hash=True)
+                path = self.checked_document(document, verify_hash='keep' in entry)
+                recycle_file(path)
+                result['trashed'] += 1
+            except (OSError, ValueError) as exc:
+                result['errors'].append({'path': document['path'],
+                                        'error': str(exc) if isinstance(exc, ValueError) else failure(exc)})
+            progress(index + 1)
+        self.scan(progress)
+        return result
 
     def flatten(self, progress=lambda count: None):
         pending = [m for m in self.state["moves"] if not m["done"]]

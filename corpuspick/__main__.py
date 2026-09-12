@@ -20,6 +20,7 @@ class App:
         self.search, self.filter = tk.StringVar(), tk.StringVar(value='Все файлы')
         self.status = tk.StringVar(value='Откройте рабочий каталог. Просмотр и сортировка документов — в Explorer.')
         self.details = tk.StringVar(value='F5 — обновить · Enter или двойной щелчок — показать файл в Проводнике')
+        self.totals = tk.StringVar(value='Итого по каталогу: —')
         window.title('CorpusPick — каталоги и состав документов')
         window.geometry('1120x700')
         window.minsize(720, 420)
@@ -39,7 +40,7 @@ class App:
         bar.grid(row=0, column=0, sticky='ew')
         self.buttons = []
         for title, command in [('Открыть каталог', self.open_folder), ('Перенести в корень', self.flatten),
-                               ('Удалить пустые папки', self.clean)]:
+                               ('Удалить пустые папки', self.clean), ('Удалить дубликаты', self.delete_duplicates)]:
             button = ttk.Button(bar, text=title, command=command)
             button.pack(side='left', padx=(0, 8))
             self.buttons.append(button)
@@ -75,14 +76,19 @@ class App:
         self.status_label.grid(row=4, column=0, sticky='ew')
         self.detail_label = ttk.Label(window, textvariable=self.details, padding=(10, 0, 10, 10), wraplength=1000)
         self.detail_label.grid(row=5, column=0, sticky='ew')
+        self.totals_label = ttk.Label(window, textvariable=self.totals, padding=(10, 6, 10, 8),
+                                     font=('Segoe UI', 9), foreground='#666666', wraplength=1000)
+        self.totals_label.grid(row=6, column=0, sticky='ew')
         def resize(event):
             width = max(500, window.winfo_width() - 30)
             self.detail_label.configure(wraplength=width)
             self.status_label.configure(wraplength=width)
+            self.totals_label.configure(wraplength=width)
         window.bind('<Configure>', resize)
         self.context = tk.Menu(window, tearoff=False)
         self.context.add_command(label='Показать в Проводнике', command=self.show_in_explorer)
         self.context.add_command(label='Копировать путь', command=self.copy_path)
+        self.context.add_command(label='Удалить в корзину     Delete', command=self.delete_selected)
         self.context.add_separator()
         self.context.add_command(label='Скорее да — поставить / снять     2', command=self.mark)
         self.tree.bind('<Button-3>', self.popup)
@@ -90,6 +96,7 @@ class App:
         self.tree.bind('<Double-1>', lambda _: self.show_in_explorer())
         self.tree.bind('<Return>', lambda _: self.show_in_explorer())
         self.tree.bind('2', lambda _: self.mark())
+        self.tree.bind('<Delete>', lambda _: self.delete_selected())
         window.bind('<F5>', lambda _: self.scan())
         self.search.trace_add('write', lambda *_: self.render())
         self.filter.trace_add('write', lambda *_: self.render())
@@ -176,14 +183,15 @@ class App:
                         f"Лишних точных копий: {len(hashes)-len(set(hashes))} · Ошибок: {errors} · "
                         f"Недоступных каталогов: {len(self.session.state.get('issues', []))}" +
                         (f' · Не перенесено: {pending} (повторите перенос)' if pending else ''))
-        totals = []
+        totals = [f"Файлов: {len(docs)}", f"Байт: {sum(d.get('size') or 0 for d in docs):,}".replace(',', ' ')]
         for field, label in [('pages', 'Страниц'), ('figures', 'Рисунков'), ('tables', 'Таблиц'), ('appendices', 'Приложений')]:
             known = [d['stats'] for d in docs if d.get('stats', {}).get(field) is not None]
             if known:
                 prefix = '≈' if any(s.get(field + '_estimated') for s in known) else ''
                 totals.append(f"{label}: {prefix}{sum(s[field] for s in known)} ({len(known)} файлов)")
-        if totals:
-            self.status.set(self.status.get() + '\n' + ' · '.join(totals))
+            else:
+                totals.append(f'{label}: —')
+        self.totals.set('Итого по всему каталогу, включая копии: ' + ' · '.join(totals))
         self.render()
 
     def render(self):
@@ -265,6 +273,40 @@ class App:
         if self.selected():
             self.window.clipboard_clear()
             self.window.clipboard_append(str(self.session.root / self.selected()['path']))
+
+    def delete_selected(self):
+        if self.busy or not self.selected():
+            return
+        document = dict(self.selected())
+        following = self.tree.next(document['path']) or self.tree.prev(document['path'])
+        if not messagebox.askyesno('Удалить в корзину', f"Отправить в корзину файл?\n\n{document['path']}"):
+            return
+        def finished(result):
+            if result['errors']:
+                self.result('Корзина', f"Отправлено в корзину: {result['trashed']}.", result['errors'])
+            elif following and self.tree.exists(following):
+                self.tree.selection_set(following)
+                self.tree.see(following)
+                self.tree.focus_set()
+        self.run('Удаление в корзину', lambda: self.session.trash_documents([document], progress=self.tick), finished)
+
+    def delete_duplicates(self):
+        if not self.session or self.busy:
+            return
+        def confirm(plan):
+            if not plan:
+                messagebox.showinfo('Дубликаты', 'Точных дубликатов не найдено.')
+                return
+            size = sum(entry['remove'].get('size') or 0 for entry in plan)
+            if messagebox.askyesno('Удалить дубликаты',
+                f'Отправить в корзину {len(plan)} точных копий ({size / 1024 / 1024:.1f} МБ)?\n\n'
+                'В каждой группе останется один файл: сначала с меткой «Скорее да», затем ближе к корню, '
+                'затем первый по имени. Перед удалением содержимое проверяется повторно.\n\n'
+                'Действие относится ко всему каталогу, независимо от фильтра списка.'):
+                self.run('Удаление дублей в корзину',
+                         lambda: self.session.trash_documents(duplicate_plan=plan, progress=self.tick),
+                         lambda result: self.result('Дубликаты', f"Отправлено в корзину: {result['trashed']}.", result['errors']))
+        self.run('Проверка точных дублей', lambda: self.session.duplicate_plan(self.tick), confirm)
 
     def result(self, title, summary, errors):
         if errors:
