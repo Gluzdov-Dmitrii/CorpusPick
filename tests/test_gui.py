@@ -3,6 +3,7 @@ import tempfile
 import time
 import tkinter as tk
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 from corpuspick.core import Session
 from corpuspick.__main__ import App
@@ -37,6 +38,20 @@ class GuiSmokeTest(unittest.TestCase):
                 self.assertIn('pages', app.tree['columns'])
                 self.assertNotIn('appendices', app.tree['columns'])
                 self.assertNotIn('error', app.tree['columns'])
+                for keysym, keycode in [('a', 65), ('A', 65), ('Cyrillic_ef', 65)]:
+                    app.tree.selection_remove(app.tree.selection())
+                    self.assertEqual(app.control_key(SimpleNamespace(widget=app.tree, keysym=keysym, keycode=keycode)), 'break')
+                    self.assertEqual(len(app.tree.selection()), 2)
+                app.tree.selection_remove(app.tree.selection())
+                window.deiconify()
+                window.update()
+                app.tree.focus_force()
+                window.update()
+                app.tree.event_generate('<KeyPress>', keycode=65, state=4)
+                window.update()
+                self.assertEqual(len(app.tree.selection()), 2)
+                window.withdraw()
+                app.tree.selection_remove(app.tree.selection())
                 app.last_tick = 0
                 app.tick(10)
                 self.assertEqual(app.events.get_nowait(), ('progress', 10))

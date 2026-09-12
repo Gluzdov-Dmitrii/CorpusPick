@@ -403,6 +403,40 @@ class Session:
         self.scan(progress)
         return result
 
+    def trim_first_character(self, documents, progress=lambda count: None):
+        self.require_write()
+        if any(not m['done'] for m in self.state['moves']):
+            raise ValueError('Сначала завершите перенос или нажмите «Сбросить план»')
+        pending, errors = [], []
+        reserved = set()
+        for document in documents:
+            try:
+                source = self.checked_document(document)
+                if len(source.stem) <= 1:
+                    raise ValueError('После удаления символа имя станет пустым')
+                name = source.name[1:]
+                stem = Path(name).stem
+                if name.startswith('.') or name.endswith((' ', '.')) or stem.upper().split('.')[0] in {
+                    'CON', 'PRN', 'AUX', 'NUL', *('COM' + str(i) for i in range(1, 10)),
+                    *('LPT' + str(i) for i in range(1, 10))}:
+                    raise ValueError('Недопустимое новое имя Windows')
+                destination = source.with_name(name)
+                if Path(native(destination)).exists() or str(destination).casefold() in reserved:
+                    raise ValueError('Такое имя уже существует; файл пропущен')
+                reserved.add(str(destination).casefold())
+                pending.append({'source': document['path'], 'destination': str(destination.relative_to(self.root)),
+                                'origin': document['origin'], 'hash': document.get('hash', ''),
+                                'identity': document['identity'], 'method': 'rename', 'done': False})
+            except (OSError, ValueError) as exc:
+                errors.append({'path': document['path'], 'error': str(exc) if isinstance(exc, ValueError) else failure(exc)})
+        if not pending:
+            return {'moved': 0, 'errors': errors}
+        self.state['moves'].extend(pending)
+        self.save()
+        result = self.flatten(progress)
+        result['errors'] = errors + result['errors']
+        return result
+
     def flatten(self, progress=lambda count: None):
         self.require_write()
         pending = [m for m in self.state["moves"] if not m["done"]]

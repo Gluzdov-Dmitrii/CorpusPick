@@ -36,6 +36,7 @@ class App:
         self.view_docs = []
         self.last_tick = 0
         self.sort_column, self.sort_reverse = 'number', False
+        self.similarity_ranks = {}
         self.search, self.filter = tk.StringVar(), tk.StringVar(value='Все файлы')
         self.backup_mode = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value='Откройте каталог. Для нетронутого бэкапа сначала включите режим «Бэкап».')
@@ -80,6 +81,12 @@ class App:
         ttk.Entry(filters, textvariable=self.search).grid(row=0, column=1, sticky='ew')
         ttk.Combobox(filters, textvariable=self.filter, state='readonly', width=19,
                      values=['Все файлы', 'Точные дубли', 'Есть ошибки', 'Скорее да']).grid(row=0, column=2, padx=(8, 0))
+        for column, label, fn in [(3, 'По похожести', self.sort_similar), (4, 'Убрать первый символ', self.trim_names)]:
+            button = ttk.Button(filters, text=label, command=fn)
+            button.grid(row=0, column=column, padx=(8, 0))
+            self.buttons.append(button)
+            if column == 4:
+                self.mutation_buttons.append(button)
         listing = ttk.Frame(window, padding=(10, 0))
         listing.grid(row=3, column=0, sticky='nsew')
         listing.columnconfigure(0, weight=1)
@@ -126,7 +133,8 @@ class App:
         self.tree.bind('<Return>', lambda _: self.show_in_explorer())
         self.tree.bind('<Delete>', lambda _: self.delete_selected())
         self.tree.bind('2', lambda _: self.mark())
-        self.tree.bind('<Control-a>', self.select_all)
+        self.tree.bind('<Control-KeyPress>', self.control_key)
+        window.bind('<Control-KeyPress>', self.control_key)
         window.bind('<F5>', lambda _: self.scan())
         window.bind('<Escape>', lambda _: self.stop() if self.busy else self.clear_selection())
         self.search.trace_add('write', lambda *_: self.render())
@@ -250,6 +258,8 @@ class App:
         def key(pair):
             number, d = pair
             c = self.sort_column
+            if c == 'similarity':
+                return self.similarity_ranks.get(d['path'], len(self.similarity_ranks) + number)
             if c == 'number':
                 return number
             if c in ('pages', 'figures', 'tables'):
@@ -303,6 +313,34 @@ class App:
     def select_all(self, _=None):
         self.tree.selection_set(self.tree.get_children())
         return 'break'
+
+    def control_key(self, event):
+        if event.widget.winfo_class() in ('Entry', 'TEntry', 'Text', 'TCombobox'):
+            return
+        if event.keysym.casefold() in ('a', 'cyrillic_ef') or (os.name == 'nt' and event.keycode == 65):
+            return self.select_all()
+
+    def sort_similar(self):
+        if self.busy or not self.session:
+            return
+        from .similarity import similar_order
+        docs = copy.deepcopy(self.view_docs)
+        def done(ranks):
+            if ranks is not None:
+                self.similarity_ranks = ranks
+                self.sort_column, self.sort_reverse = 'similarity', False
+                self.render()
+                self.status.set('По похожести названий → размеру → типу. Это не проверка дублей.')
+        self.run('Группировка похожих названий', lambda: similar_order(docs, self.session.cancel, self.tick), done)
+
+    def trim_names(self):
+        docs = copy.deepcopy(self.selected_documents())
+        if self.busy or not docs or self.session.read_only:
+            return
+        preview = '\n'.join(f"{Path(d['path']).name} → {Path(d['path']).name[1:]}" for d in docs[:5])
+        if messagebox.askyesno('Убрать первый символ', f'Переименовать выбранные файлы: {len(docs)}?\n{preview}\nРасширение сохраняется. Конфликты имён пропускаются.'):
+            self.run('Переименование', lambda: self.session.trim_first_character(docs, self.tick),
+                     lambda r: self.result('Переименование', f"Переименовано: {r['moved']}. Исходные пути сохранены.", r['errors']))
 
     def clear_selection(self):
         self.tree.selection_remove(self.tree.selection())
