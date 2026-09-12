@@ -70,7 +70,7 @@ class CorpusTests(unittest.TestCase):
         self.session.scan()
         original_unlink = Path.unlink
         def fail(path, *args, **kwargs):
-            if path == source:
+            if path.resolve() == source.resolve():
                 raise OSError("simulated interruption")
             return original_unlink(path, *args, **kwargs)
         with patch.object(Path, "unlink", fail):
