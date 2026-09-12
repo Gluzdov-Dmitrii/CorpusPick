@@ -74,7 +74,7 @@ class GuiSmokeTest(unittest.TestCase):
                 app.tree.selection_set('a.txt')
                 with patch('corpuspick.__main__.show_file') as show:
                     app.show_in_explorer()
-                    show.assert_called_once_with(root / 'a.txt')
+                    show.assert_called_once_with(root.resolve() / 'a.txt')
                 app.session.close()
                 app.session = None
         finally:
