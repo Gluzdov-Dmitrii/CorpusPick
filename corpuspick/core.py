@@ -403,18 +403,20 @@ class Session:
         self.scan(progress)
         return result
 
-    def trim_first_character(self, documents, progress=lambda count: None):
+    def trim_prefix(self, documents, count, progress=lambda count: None):
         self.require_write()
         if any(not m['done'] for m in self.state['moves']):
             raise ValueError('Сначала завершите перенос или нажмите «Сбросить план»')
+        if type(count) is not int or count < 1:
+            raise ValueError('Введите целое число символов больше нуля')
         pending, errors = [], []
         reserved = set()
         for document in documents:
             try:
                 source = self.checked_document(document)
-                if len(source.stem) <= 1:
-                    raise ValueError('После удаления символа имя станет пустым')
-                name = source.name[1:]
+                if len(source.stem) <= count:
+                    raise ValueError('После удаления префикса имя станет пустым')
+                name = source.stem[count:] + source.suffix
                 stem = Path(name).stem
                 if name.startswith('.') or name.endswith((' ', '.')) or stem.upper().split('.')[0] in {
                     'CON', 'PRN', 'AUX', 'NUL', *('COM' + str(i) for i in range(1, 10)),

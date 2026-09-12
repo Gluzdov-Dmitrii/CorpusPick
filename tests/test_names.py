@@ -8,6 +8,25 @@ from corpuspick.similarity import similar_order
 
 
 class NameTests(unittest.TestCase):
+    def test_trim_three_and_reject_empty_or_invalid_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'files'
+            root.mkdir()
+            for name in ('123Отчёт.docx', '123Письмо.pdf', 'abc.txt'):
+                (root / name).write_text('Synthetic')
+            session = Session(root, Path(directory) / 'state')
+            try:
+                docs = session.scan()
+                for count in (0, -1, 1.5, True):
+                    with self.assertRaises(ValueError):
+                        session.trim_prefix(docs, count)
+                result = session.trim_prefix(docs, 3)
+                self.assertEqual(result['moved'], 2)
+                self.assertEqual(len(result['errors']), 1)
+                self.assertEqual({p.name for p in root.iterdir()}, {'Отчёт.docx', 'Письмо.pdf', 'abc.txt'})
+            finally:
+                session.close()
+
     def test_trim_preserves_origin_cache_and_collision(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / 'files'
@@ -21,7 +40,7 @@ class NameTests(unittest.TestCase):
                 report = next(d for d in docs if d['path'] == '_report.txt')
                 report['origins'] = ['old/report.txt', 'other/report.txt']
                 report['stats'] = {'pages': 3}
-                result = session.trim_first_character(sorted(docs, key=lambda d: d['path']))
+                result = session.trim_prefix(sorted(docs, key=lambda d: d['path']), 1)
                 self.assertEqual(result['moved'], 1)
                 self.assertEqual(len(result['errors']), 3)
                 self.assertEqual((root / 'report.txt').read_text(), 'Synthetic _report.txt')
@@ -34,7 +53,7 @@ class NameTests(unittest.TestCase):
                 self.assertEqual(d['stats']['pages'], 3)
                 session.read_only = True
                 with self.assertRaises(ValueError):
-                    session.trim_first_character([d])
+                    session.trim_prefix([d], 1)
             finally:
                 session.close()
 

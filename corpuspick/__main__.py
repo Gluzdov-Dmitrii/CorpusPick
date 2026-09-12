@@ -6,7 +6,7 @@ import queue
 import threading
 import time
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from .core import Session, failure
 from .explorer import show_file
@@ -81,7 +81,7 @@ class App:
         ttk.Entry(filters, textvariable=self.search).grid(row=0, column=1, sticky='ew')
         ttk.Combobox(filters, textvariable=self.filter, state='readonly', width=19,
                      values=['Все файлы', 'Точные дубли', 'Есть ошибки', 'Скорее да']).grid(row=0, column=2, padx=(8, 0))
-        for column, label, fn in [(3, 'По похожести', self.sort_similar), (4, 'Убрать первый символ', self.trim_names)]:
+        for column, label, fn in [(3, 'По похожести', self.sort_similar), (4, 'Убрать префикс', self.trim_names)]:
             button = ttk.Button(filters, text=label, command=fn)
             button.grid(row=0, column=column, padx=(8, 0))
             self.buttons.append(button)
@@ -337,9 +337,10 @@ class App:
         docs = copy.deepcopy(self.selected_documents())
         if self.busy or not docs or self.session.read_only:
             return
-        preview = '\n'.join(f"{Path(d['path']).name} → {Path(d['path']).name[1:]}" for d in docs[:5])
-        if messagebox.askyesno('Убрать первый символ', f'Переименовать выбранные файлы: {len(docs)}?\n{preview}\nРасширение сохраняется. Конфликты имён пропускаются.'):
-            self.run('Переименование', lambda: self.session.trim_first_character(docs, self.tick),
+        count = simpledialog.askinteger('Убрать префикс', 'Сколько символов убрать?',
+                                        parent=self.window, initialvalue=1, minvalue=1)
+        if count is not None:
+            self.run('Переименование', lambda: self.session.trim_prefix(docs, count, self.tick),
                      lambda r: self.result('Переименование', f"Переименовано: {r['moved']}. Исходные пути сохранены.", r['errors']))
 
     def clear_selection(self):
