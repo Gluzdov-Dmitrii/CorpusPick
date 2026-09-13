@@ -13,6 +13,13 @@ from zipfile import ZipFile
 
 VERSION = 1
 LIMIT = 256
+MAX_CONTENT_BYTES = 128 * 1024 * 1024
+
+
+def size_only(document):
+    return document.get('size', 0) > MAX_CONTENT_BYTES
+
+
 GEAR = [int.from_bytes(hashlib.blake2b(bytes([i]), digest_size=8).digest(), 'little') for i in range(256)]
 
 GEAR_LOW = [v & 1023 for v in GEAR]
@@ -219,10 +226,13 @@ def fingerprint_key(fp):
 
 def content_order(documents, cancel, progress=lambda count: None):
     # Collapse identical fingerprints, but never collapse unknown/failed files.
-    buckets, unknown = {}, []
+    buckets, unknown, large = {}, [], {}
     for document in documents:
         if cancel.is_set():
             return None
+        if size_only(document):
+            large.setdefault(Path(document['path']).suffix.casefold(), []).append(document)
+            continue
         fp = document.get('content', {})
         if fp.get('failed') or not fp.get('sha256'):
             unknown.append(document)
@@ -295,4 +305,17 @@ def content_order(documents, cancel, progress=lambda count: None):
         path = document['path']
         ranks[path], groups[path] = len(ranks), len(members) + offset
         notes[path] = 'Содержимое не проанализировано; оставлен отдельно'
+    group = len(members) + len(unknown) - 1
+    for extension in sorted(large):
+        anchor = None
+        for document in sorted(large[extension], key=lambda d: d['size']):
+            if cancel.is_set():
+                return None
+            size = document['size']
+            if anchor is None or anchor / size < .95:
+                group += 1
+                anchor = size
+            path = document['path']
+            ranks[path], groups[path] = len(ranks), group
+            notes[path] = 'Только размер и расширение: разброс до 5%; содержимое не проверялось в этом проходе (файл >128 МиБ). Не подтверждённые дубли.'
     return ranks, groups, notes

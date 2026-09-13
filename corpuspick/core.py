@@ -350,8 +350,13 @@ class Session:
         item["note"] = "" if item.get("note") else "Скорее да"
         self.save()
 
+    def clear_similarity_cache(self):
+        for document in self.state['documents']:
+            document.pop('content', None)
+        self.save()
+
     def group_similar(self, progress=lambda count: None):
-        from .content_similarity import VERSION, content_worker, content_order
+        from .content_similarity import VERSION, content_worker, content_order, size_only
         from .stats_worker import StatsWorker
         self.scan(progress, hash_files=False)
         last_save = time.monotonic()
@@ -362,7 +367,7 @@ class Session:
                 signature = document.get('content', {})
                 try:
                     path = self.checked_document(document)
-                    if signature.get('version') != VERSION or signature.get('failed') or signature.get('text_failed'):
+                    if not size_only(document) and (signature.get('version') != VERSION or signature.get('failed') or signature.get('text_failed')):
                         signature = worker.count(path, self.cancel)
                         self.checked_document(document)
                         document['content'] = signature

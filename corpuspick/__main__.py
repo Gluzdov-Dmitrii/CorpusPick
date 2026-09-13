@@ -93,6 +93,7 @@ class App:
             self.buttons.append(button)
             if column == 3:
                 self.similarity_button = button
+                button.bind('<Button-3>', self.similarity_menu)
             if column == 4:
                 self.mutation_buttons.append(button)
         listing = ttk.Frame(window, padding=(10, 0))
@@ -346,6 +347,31 @@ class App:
         if event.keysym.casefold() in ('a', 'cyrillic_ef') or (os.name == 'nt' and event.keycode == 65):
             return self.select_all()
 
+    def similarity_menu(self, event):
+        if self.busy or not self.session:
+            return
+        if hasattr(self, 'similarity_context'):
+            self.similarity_context.destroy()
+        menu = self.similarity_context = tk.Menu(self.window, tearoff=False)
+        menu.add_command(label='Сбросить кэш похожести', command=self.clear_similarity_cache)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def clear_similarity_cache(self):
+        if self.busy or not self.session:
+            return
+        if not messagebox.askyesno('Кэш похожести', 'Удалить отпечатки содержимого для текущего каталога?\nИсходные пути, CSV, SHA точных дублей и статистика сохранятся.\nСледующее сравнение заново прочитает файлы до 128 МиБ.'):
+            return
+        def done(_):
+            self.similarity_notes, self.similarity_groups, self.similarity_ranks = {}, {}, {}
+            self.similarity_button.configure(text='По похожести')
+            self.sort_column, self.sort_reverse = 'number', False
+            self.refreshed()
+            self.status.set('Кэш похожести текущего каталога сброшен. Исходная структура сохранена.')
+        self.run('Сброс кэша похожести', self.session.clear_similarity_cache, done)
+
     def sort_similar(self):
         if self.busy or not self.session:
             return
@@ -365,7 +391,9 @@ class App:
                 self.sort_column, self.sort_reverse = 'similarity', False
                 self.render()
                 unavailable = sum(bool(d.get('content', {}).get('failed') or d.get('content', {}).get('text_failed')) for d in self.view_docs)
-                self.status.set(f'Группировка только по содержимому (complete-link) · Ошибок чтения/извлечения: {unavailable}. '
+                from .content_similarity import size_only
+                large = sum(size_only(d) for d in self.view_docs)
+                self.status.set(f'Группировка по содержимому (complete-link) · Только размер (>128 МиБ): {large} · Ошибок чтения/извлечения: {unavailable}. '
                                 'Заголовки сортируют внутри групп. Основание сравнения — под выбранным файлом.')
         self.run('Сравнение содержимого файлов', lambda: self.session.group_similar(self.tick), done)
 

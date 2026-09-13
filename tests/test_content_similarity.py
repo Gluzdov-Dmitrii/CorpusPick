@@ -11,6 +11,40 @@ from corpuspick.content_similarity import fingerprint, evidence, content_order
 
 
 class ContentTests(unittest.TestCase):
+    def test_large_files_group_only_by_size_and_extension_without_chain(self):
+        from corpuspick.content_similarity import MAX_CONTENT_BYTES, size_only
+        self.assertFalse(size_only({'size': MAX_CONTENT_BYTES}))
+        self.assertTrue(size_only({'size': MAX_CONTENT_BYTES + 1}))
+        docs = [{'path': name, 'size': size * 1024 * 1024} for name, size in
+                [('a.rst', 200), ('unrelated.RST', 208), ('a.zip', 200), ('b.rst', 216)]]
+        _, groups, notes = content_order(docs, threading.Event())
+        self.assertEqual(groups['a.rst'], groups['unrelated.RST'])
+        self.assertNotEqual(groups['a.rst'], groups['a.zip'])
+        self.assertNotEqual(groups['a.rst'], groups['b.rst'])
+        self.assertTrue(all('Только размер' in note for note in notes.values()))
+
+    def test_large_skip_and_cache_reset_preserve_structure_and_hash(self):
+        self.put('a.zip', b'synthetic archive')
+        session = Session(self.root, self.base / 'state', read_only=True)
+        try:
+            # A lowered threshold exercises the real scan without allocating GB files.
+            with patch('corpuspick.content_similarity.MAX_CONTENT_BYTES', 4), \
+                 patch('corpuspick.stats_worker.StatsWorker.count', side_effect=AssertionError('Must not read large file')):
+                result = session.group_similar()
+                self.assertIn('Только размер', result[2]['a.zip'])
+            doc = session.state['documents'][0]
+            doc.update(content={'sha256': 'synthetic'}, hash='keep', origin='original/a.zip', stats={'pages': 2})
+            session.clear_similarity_cache()
+            session.close()
+            session = Session(self.root, self.base / 'state', read_only=True)
+            doc = session.state['documents'][0]
+            self.assertNotIn('content', doc)
+            self.assertEqual(doc['origin'], 'original/a.zip')
+            self.assertEqual(doc['hash'], 'keep')
+            self.assertEqual(doc['stats'], {'pages': 2})
+        finally:
+            session.close()
+
     def test_names_paths_and_input_order_cannot_change_groups(self):
         data = random.Random(81).randbytes(4096)
         fps = [fingerprint(self.put('a.bin', data)),
