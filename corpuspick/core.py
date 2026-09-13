@@ -350,6 +350,38 @@ class Session:
         item["note"] = "" if item.get("note") else "Скорее да"
         self.save()
 
+    def group_similar(self, progress=lambda count: None):
+        from .content_similarity import VERSION, content_worker, content_order
+        from .stats_worker import StatsWorker
+        self.scan(progress, hash_files=False)
+        last_save = time.monotonic()
+        with StatsWorker(timeout=90, target=content_worker, retry_label='По похожести') as worker:
+            for index, document in enumerate(self.state['documents']):
+                if self.cancel.is_set():
+                    break
+                signature = document.get('content', {})
+                try:
+                    path = self.checked_document(document)
+                    if signature.get('version') != VERSION or signature.get('failed') or signature.get('text_failed'):
+                        signature = worker.count(path, self.cancel)
+                        self.checked_document(document)
+                        document['content'] = signature
+                        if signature.get('sha256'):
+                            document['hash'] = signature['sha256']
+                except Cancelled:
+                    break
+                except (OSError, ValueError):
+                    document.update(content={'failed': True, 'info': 'Файл недоступен или изменился во время анализа'}, hash='')
+                progress(index + 1)
+                if time.monotonic() - last_save > 5:
+                    self.save()
+                    last_save = time.monotonic()
+        self.regroup()
+        self.save()
+        if self.cancel.is_set():
+            return None
+        return content_order(self.state['documents'], self.cancel, progress)
+
     def duplicate_plan(self, progress=lambda count: None):
         self.scan(progress)
         groups = {}

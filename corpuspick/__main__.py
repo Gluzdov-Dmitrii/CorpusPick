@@ -40,6 +40,8 @@ class App:
         self.similarity_ranks = {}
         self.similarity_groups = {}
         self.column_filters = {}
+        self.similarity_notes = {}
+        self.similarity_identities = {}
         self.search, self.filter = tk.StringVar(), tk.StringVar(value='Все файлы')
         self.backup_mode = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value='Откройте каталог. Для нетронутого бэкапа сначала включите режим «Бэкап».')
@@ -234,6 +236,7 @@ class App:
         if self.session:
             self.session.close()
         self.session = session
+        self.similarity_notes = {}
         self.column_filters = {}
         self.similarity_groups = {}
         self.similarity_ranks = {}
@@ -251,10 +254,16 @@ class App:
         if not self.session:
             return
         self.view_docs = copy.deepcopy(self.session.state['documents'])
+        current = {d['path']: d.get('identity') for d in self.view_docs}
+        if self.similarity_groups and current != self.similarity_identities:
+            self.similarity_groups, self.similarity_ranks, self.similarity_notes = {}, {}, {}
+            self.similarity_button.configure(text='По похожести')
+            if self.sort_column == 'similarity':
+                self.sort_column, self.sort_reverse = 'number', False
         docs = self.view_docs
         pending = sum(not m['done'] for m in self.session.state['moves'])
         self.status.set(f"Файлов: {len(docs)} · SHA-256: {sum(bool(d.get('hash')) for d in docs)}/{len(docs)} · "
-                        f"Ошибок: {sum(bool(d.get('error') or d.get('stats', {}).get('failed')) for d in docs)}" +
+                        f"Ошибок: {sum(bool(d.get('error') or d.get('stats', {}).get('failed') or d.get('content', {}).get('failed') or d.get('content', {}).get('text_failed')) for d in docs)}" +
                         (' · БЭКАП: файлы не изменяются' if self.session.read_only else ' · Unlock автоматически') +
                         (f' · Не перенесено: {pending}' if pending else '') +
                         (' · Остановлено, прогресс сохранён' if self.session.cancel.is_set() else ''))
@@ -288,7 +297,7 @@ class App:
             if self.search.get().casefold() not in (d['path'] + ' ' + ' '.join(origins)).casefold():
                 continue
             f = self.filter.get()
-            if f == 'Точные дубли' and not d.get('duplicate') or f == 'Есть ошибки' and not (d.get('error') or d.get('stats', {}).get('failed')):
+            if f == 'Точные дубли' and not d.get('duplicate') or f == 'Есть ошибки' and not (d.get('error') or d.get('stats', {}).get('failed') or d.get('content', {}).get('failed') or d.get('content', {}).get('text_failed')):
                 continue
             stats = d.get('stats', {})
             def metric(name):
@@ -321,7 +330,9 @@ class App:
             d = docs[0]
             self.details.set(f"Путь: {self.session.root / d['path']}\nИсходные пути: {' | '.join(d.get('origins', [d['origin']]))}" +
                              (' · ' + d['origin_match'] if d.get('origin_match') else '') +
-                             ('\n' + (d.get('error') or d['stats']['info']) if d.get('error') or d.get('stats', {}).get('failed') else ''))
+                             ('\n' + (d.get('error') or d['stats']['info']) if d.get('error') or d.get('stats', {}).get('failed') else '') +
+                             ('\nСравнение: ' + self.similarity_notes[d['path']] if d['path'] in self.similarity_notes else '') +
+                             ('\n' + d['content']['info'] if d.get('content', {}).get('info') else ''))
         else:
             self.details.set(f'Выделено: {len(docs)} · Ctrl/Shift — выбор · Ctrl+A — все видимые · Esc — снять выбор / стоп · Delete — корзина')
 
@@ -339,22 +350,24 @@ class App:
         if self.busy or not self.session:
             return
         if self.similarity_groups:
+            self.similarity_notes = {}
             self.similarity_groups = {}
             self.similarity_ranks = {}
             self.similarity_button.configure(text='По похожести')
             self.sort_column, self.sort_reverse = 'number', False
             self.refreshed()
             return
-        from .similarity import similar_order
-        docs = copy.deepcopy(self.view_docs)
         def done(ranks):
             if ranks is not None:
-                self.similarity_ranks, self.similarity_groups = ranks
+                self.similarity_ranks, self.similarity_groups, self.similarity_notes = ranks
+                self.similarity_identities = {d['path']: d.get('identity') for d in self.view_docs}
                 self.similarity_button.configure(text='Снять группировку')
                 self.sort_column, self.sort_reverse = 'similarity', False
                 self.render()
-                self.status.set('Группировка по похожести: заголовки сортируют внутри групп. Это не проверка дублей.')
-        self.run('Группировка похожих названий', lambda: similar_order(docs, self.session.cancel, self.tick, with_groups=True), done)
+                unavailable = sum(bool(d.get('content', {}).get('failed') or d.get('content', {}).get('text_failed')) for d in self.view_docs)
+                self.status.set(f'Группировка по содержимому и названиям · Ошибок чтения/извлечения: {unavailable}. '
+                                'Заголовки сортируют внутри групп. Основание сравнения — под выбранным файлом.')
+        self.run('Сравнение содержимого файлов', lambda: self.session.group_similar(self.tick), done)
 
     def trim_names(self):
         docs = copy.deepcopy(self.selected_documents())

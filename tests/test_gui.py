@@ -96,8 +96,12 @@ class GuiSmokeTest(unittest.TestCase):
                 saved_docs = app.view_docs
                 app.view_docs = [dict(saved_docs[0], path=p, size=size, origin=p) for p, size in [
                     ('report 2024.pdf', 30), ('report 2025.pdf', 10), ('letter x.txt', 40), ('letter y.txt', 20)]]
-                app.sort_similar()
-                settle()
+                from corpuspick.similarity import similar_order
+                from threading import Event
+                ranks, groups = similar_order(app.view_docs, Event(), with_groups=True)
+                with patch.object(app.session, 'group_similar', return_value=(ranks, groups, {})):
+                    app.sort_similar()
+                    settle()
                 # Completion refreshes the session view; use the synthetic grouping fixture again.
                 app.view_docs = [dict(saved_docs[0], path=p, size=size, origin=p) for p, size in [
                     ('report 2024.pdf', 30), ('report 2025.pdf', 10), ('letter x.txt', 40), ('letter y.txt', 20)]]

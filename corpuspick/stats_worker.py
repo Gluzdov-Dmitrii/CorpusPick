@@ -28,9 +28,10 @@ def _worker_main(connection):
 
 
 class StatsWorker:
-    def __init__(self, timeout=30, target=_worker_main):
+    def __init__(self, timeout=30, target=_worker_main, retry_label='Статистика'):
         self.timeout = timeout
         self.target = target
+        self.retry_label = retry_label
         self.process = self.connection = None
 
     def _start(self):
@@ -64,7 +65,7 @@ class StatsWorker:
                     return self.connection.recv()
                 if time.monotonic() >= deadline:
                     self.close()
-                    return {'failed': True, 'info': f'Подсчёт превысил {self.timeout:g} с; файл пропущен. Нажмите «Статистика» для повтора.'}
+                    return {'failed': True, 'info': f'Обработка превысила {self.timeout:g} с; файл пропущен. Нажмите «{self.retry_label}» для повтора.'}
                 if not self.process.is_alive():
                     raise EOFError()
         except (EOFError, BrokenPipeError, OSError):
