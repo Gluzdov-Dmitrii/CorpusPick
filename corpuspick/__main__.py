@@ -55,11 +55,12 @@ class App:
         main = ttk.Frame(window, padding=(10, 10, 10, 4))
         main.grid(row=0, column=0, sticky='ew')
         for label, fn in [('Открыть каталог', self.open_folder), ('Перенести в корень', self.flatten),
-                          ('Удалить пустые папки', self.clean), ('Удалить дубликаты', self.delete_duplicates)]:
+                          ('Удалить пустые папки', self.clean), ('Найти дубли', self.find_duplicates),
+                          ('Удалить дубликаты', self.delete_duplicates)]:
             b = ttk.Button(main, text=label, command=fn)
             b.pack(side='left', padx=(0, 6))
             self.buttons.append(b)
-            if fn != self.open_folder:
+            if fn not in (self.open_folder, self.find_duplicates):
                 self.mutation_buttons.append(b)
         self.backup_check = ttk.Checkbutton(main, text='Бэкап: открыть без изменений', variable=self.backup_mode)
         self.backup_check.pack(side='left')
@@ -100,7 +101,7 @@ class App:
         self.tree = ttk.Treeview(listing, columns=self.columns, show='headings', selectmode='extended')
         titles = ['№', 'Файл', 'Текущая папка', 'Исходный путь / варианты', 'Тип', 'Байт', 'Дубль', 'Стр.', 'Рис.', 'Табл.']
         self.titles = dict(zip(self.columns, titles))
-        for column, title, width in zip(self.columns, titles, [50, 220, 110, 240, 55, 90, 60, 65, 60, 60]):
+        for column, title, width in zip(self.columns, titles, [50, 220, 110, 240, 55, 90, 110, 65, 60, 60]):
             self.tree.heading(column, text=title + ' ▾', command=lambda c=column: self.header_menu(c))
             self.tree.column(column, width=width, minwidth=40, stretch=column in ('name', 'origin'),
                              anchor='e' if column in ('number', 'size', 'pages', 'figures', 'tables') else 'w')
@@ -295,7 +296,7 @@ class App:
                 return '—' if value is None else ('≈' if stats.get(name + '_estimated') else '') + str(value)
             self.tree.insert('', 'end', iid=d['path'], values=(number, Path(d['path']).name, str(Path(d['path']).parent),
                 ' | '.join(origins), Path(d['path']).suffix.lower() or '—', d.get('size') if d.get('size') is not None else '—',
-                f"#{d['duplicate']}" if d.get('duplicate') else ('?' if not d.get('hash') else '—'), metric('pages'),
+                f"#{d['duplicate']}" if d.get('duplicate') else ('Не проверен' if not d.get('hash') else '—'), metric('pages'),
                 metric('figures'), metric('tables')),
                 tags=('error',) if d.get('error') or stats.get('failed') else ())
         existing = [p for p in selected if self.tree.exists(p)]
@@ -467,6 +468,19 @@ class App:
                 self.run('Удаление дублей', lambda: self.session.trash_documents(duplicate_plan=plan, progress=self.tick),
                          lambda r: self.result('Дубликаты', f"Отправлено: {r['trashed']}", r['errors']))
         self.run('Проверка дублей', lambda: self.session.duplicate_plan(self.tick), confirm)
+
+    def find_duplicates(self):
+        if not self.session or self.busy:
+            return
+        def done(plan):
+            documents = self.session.state['documents']
+            unknown = sum(not d.get('hash') for d in documents)
+            groups = len({d['duplicate'] for d in documents if d.get('duplicate')})
+            self.status.set(f"Проверка дублей: {len(documents) - unknown}/{len(documents)} · "
+                            f"Групп: {groups} · Лишних копий: {len(plan)}" +
+                            (f" · Не проверено: {unknown}. Нажмите «Найти дубли» для продолжения." if unknown else '') +
+                            (' · Остановлено' if self.session.cancel.is_set() else ''))
+        self.run('Поиск точных дублей по SHA-256', lambda: self.session.duplicate_plan(self.tick), done)
 
     def flatten(self):
         if self.session and not self.busy and not self.session.read_only and messagebox.askyesno('Перенос',

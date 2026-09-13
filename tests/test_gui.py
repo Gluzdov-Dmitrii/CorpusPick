@@ -124,6 +124,19 @@ class GuiSmokeTest(unittest.TestCase):
                 with patch('corpuspick.__main__.show_files') as show:
                     app.show_in_explorer()
                     show.assert_called_once_with([root.resolve() / 'a.txt', root.resolve() / 'b.txt'])
+                (root / 'b.txt').write_text('one')
+                app.scan()
+                settle()
+                self.assertEqual(app.tree.set('b.txt', 'duplicate'), 'Не проверен')
+                with patch('corpuspick.statistics.document_stats', side_effect=AssertionError('No stats during duplicate search')), patch('corpuspick.core.recycle_file', side_effect=AssertionError('Read-only search')):
+                    app.find_duplicates()
+                    settle()
+                self.assertTrue(app.tree.set('a.txt', 'duplicate').startswith('#'))
+                self.assertEqual(app.tree.set('a.txt', 'duplicate'), app.tree.set('b.txt', 'duplicate'))
+                self.assertIn('Лишних копий: 1', app.status.get())
+                with patch('corpuspick.core.digest', side_effect=AssertionError('Reuse hashes')):
+                    app.find_duplicates()
+                    settle()
                 app.session.close()
                 app.session = None
         finally:
