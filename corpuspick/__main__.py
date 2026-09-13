@@ -10,6 +10,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from .core import Session, failure
 from .explorer import show_files
+from .filters import FilterDialog, NUMERIC, column_value, matches
 
 
 def totals_text(documents, selected=False):
@@ -38,6 +39,7 @@ class App:
         self.sort_column, self.sort_reverse = 'number', False
         self.similarity_ranks = {}
         self.similarity_groups = {}
+        self.column_filters = {}
         self.search, self.filter = tk.StringVar(), tk.StringVar(value='Все файлы')
         self.backup_mode = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value='Откройте каталог. Для нетронутого бэкапа сначала включите режим «Бэкап».')
@@ -99,7 +101,7 @@ class App:
         titles = ['№', 'Файл', 'Текущая папка', 'Исходный путь / варианты', 'Тип', 'Байт', 'Дубль', 'Стр.', 'Рис.', 'Табл.']
         self.titles = dict(zip(self.columns, titles))
         for column, title, width in zip(self.columns, titles, [50, 220, 110, 240, 55, 90, 60, 65, 60, 60]):
-            self.tree.heading(column, text=title, command=lambda c=column: self.sort(c))
+            self.tree.heading(column, text=title + ' ▾', command=lambda c=column: self.header_menu(c))
             self.tree.column(column, width=width, minwidth=40, stretch=column in ('name', 'origin'),
                              anchor='e' if column in ('number', 'size', 'pages', 'figures', 'tables') else 'w')
         self.tree.tag_configure('error', foreground='#9c3a16')
@@ -231,6 +233,7 @@ class App:
         if self.session:
             self.session.close()
         self.session = session
+        self.column_filters = {}
         self.similarity_groups = {}
         self.similarity_ranks = {}
         self.similarity_button.configure(text='По похожести')
@@ -278,6 +281,8 @@ class App:
         if self.similarity_groups:
             ordered.sort(key=lambda pair: self.similarity_groups.get(pair[1]['path'], len(self.similarity_groups) + pair[0]))
         for number, d in ordered:
+            if not all(matches(column_value(d, c, number), rule) for c, rule in self.column_filters.items()):
+                continue
             origins = d.get('origins', [d['origin']])
             if self.search.get().casefold() not in (d['path'] + ' ' + ' '.join(origins)).casefold():
                 continue
@@ -297,7 +302,8 @@ class App:
         if existing:
             self.tree.selection_set(existing)
         for column, title in self.titles.items():
-            self.tree.heading(column, text=title + (' ▼' if self.sort_reverse else ' ▲') if column == self.sort_column else title)
+            direction = (' ↓' if self.sort_reverse else ' ↑') if column == self.sort_column else ''
+            self.tree.heading(column, text=title + direction + (' ●▾' if column in self.column_filters else ' ▾'))
         self.select()
 
     def selected_documents(self):
@@ -367,7 +373,46 @@ class App:
         self.sort_column = column
         self.render()
 
+    def header_menu(self, column):
+        menu = tk.Menu(self.window, tearoff=False)
+        def order(reverse):
+            self.sort_column, self.sort_reverse = column, reverse
+            self.render()
+        menu.add_command(label='По возрастанию', command=lambda: order(False))
+        menu.add_command(label='По убыванию', command=lambda: order(True))
+        menu.add_separator()
+        menu.add_command(label='Фильтр…', command=lambda: self.edit_filter(column))
+        menu.add_command(label='Снять фильтр колонки', command=lambda: self.clear_filter(column))
+        menu.add_command(label='Снять все фильтры', command=lambda: self.clear_filter())
+        try:
+            menu.tk_popup(self.window.winfo_pointerx(), self.window.winfo_pointery())
+        finally:
+            menu.grab_release()
+
+    def edit_filter(self, column):
+        dialog = FilterDialog(self.window, self.titles[column], column in NUMERIC, self.column_filters.get(column))
+        if dialog.result is not None:
+            if dialog.result:
+                self.column_filters[column] = dialog.result
+            else:
+                self.column_filters.pop(column, None)
+            self.render()
+
+    def clear_filter(self, column=None):
+        if column is None:
+            self.column_filters.clear()
+            self.search.set('')
+            self.filter.set('Все файлы')
+        else:
+            self.column_filters.pop(column, None)
+        self.render()
+
     def popup(self, event):
+        if self.tree.identify_region(event.x, event.y) == 'heading':
+            column = self.tree.identify_column(event.x)
+            if column:
+                self.header_menu(self.columns[int(column[1:]) - 1])
+            return
         row = self.tree.identify_row(event.y)
         if row and not self.busy:
             if row not in self.tree.selection():

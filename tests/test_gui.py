@@ -57,6 +57,21 @@ class GuiSmokeTest(unittest.TestCase):
                 app.last_tick = 0
                 app.tick(10)
                 self.assertEqual(app.events.get_nowait(), ('progress', 10))
+                with patch('corpuspick.__main__.FilterDialog') as dialog:
+                    dialog.return_value.result = {'include': 'a.txt'}
+                    app.edit_filter('name')
+                self.assertEqual(app.tree.get_children(), ('a.txt',))
+                self.assertIn('●', app.tree.heading('name')['text'])
+                app.select_all()
+                self.assertEqual(app.tree.selection(), ('a.txt',))
+                app.sort('size')
+                self.assertEqual(app.tree.get_children(), ('a.txt',))
+                app.column_filters['type'] = {'include': 'pdf'}
+                app.render()
+                self.assertFalse(app.tree.get_children())
+                app.clear_filter()
+                self.assertEqual(len(app.tree.get_children()), 2)
+                app.clear_selection()
                 app.session.state['documents'][0]['stats'] = {'pages': 5, 'tables': 2}
                 app.session.state['documents'][1]['stats'] = {'pages': 3, 'tables': 1}
                 app.refreshed()

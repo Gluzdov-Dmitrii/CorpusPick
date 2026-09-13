@@ -8,6 +8,21 @@ from corpuspick.similarity import similar_order
 
 
 class NameTests(unittest.TestCase):
+    def test_weighted_names_and_no_transitive_chain(self):
+        names = ['alpha beta.txt', 'alpha beta gamma.txt', 'beta gamma.txt',
+                 'Техническое задание насосы.docx', 'Техническое заданеи насосы.pdf',
+                 'Отчет по закупке насосов.docx', 'Отчет по обучению сотрудников.docx',
+                 '003_Годовой отчет насосы.docx', 'насосы отчет годовой.pdf']
+        docs = [{'path': name, 'size': 100} for name in names]
+        _, groups = similar_order(docs, threading.Event(), with_groups=True)
+        self.assertEqual(groups[names[0]], groups[names[1]])
+        self.assertNotEqual(groups[names[0]], groups[names[2]])
+        self.assertEqual(groups[names[3]], groups[names[4]])
+        self.assertNotEqual(groups[names[5]], groups[names[6]])
+        self.assertEqual(groups[names[7]], groups[names[8]])
+        _, reversed_groups = similar_order(list(reversed(docs)), threading.Event(), with_groups=True)
+        self.assertEqual(groups, reversed_groups)
+
     def test_trim_three_and_reject_empty_or_invalid_count(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / 'files'
