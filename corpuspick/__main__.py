@@ -393,8 +393,9 @@ class App:
                 unavailable = sum(bool(d.get('content', {}).get('failed') or d.get('content', {}).get('text_failed')) for d in self.view_docs)
                 from .content_similarity import size_only
                 large = sum(size_only(d) for d in self.view_docs)
-                self.status.set(f'Группировка по содержимому (complete-link) · Только размер (>128 МиБ): {large} · Ошибок чтения/извлечения: {unavailable}. '
-                                'Заголовки сортируют внутри групп. Основание сравнения — под выбранным файлом.')
+                self.status.set(f'Подтверждённые содержанием группы — сначала; остальные — в конце по типу и размеру · '
+                                f'Без чтения (>128 МиБ): {large} · Ошибок чтения/извлечения: {unavailable}. '
+                                'Заголовки сортируют внутри групп. Основание — под выбранным файлом.')
         self.run('Сравнение содержимого файлов', lambda: self.session.group_similar(self.tick), done)
 
     def trim_names(self):

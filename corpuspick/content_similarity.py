@@ -224,6 +224,39 @@ def fingerprint_key(fp):
     return json.dumps({k: fp.get(k) for k in fields}, sort_keys=True, separators=(',', ':'))
 
 
+def physical_key(document):
+    """Fallback display order only; it does not claim content similarity."""
+    return Path(document['path']).suffix.casefold(), document.get('size', 0)
+
+
+def append_physical_groups(documents, ranks, groups, notes, first_group, cancel):
+    """Put unconfirmed files last, grouped by extension and a 5% size band."""
+    group = first_group - 1
+    anchor, extension = None, None
+    for document in sorted(documents, key=physical_key):
+        if cancel.is_set():
+            return None
+        current_extension, size = physical_key(document)
+        new_band = current_extension != extension
+        if not new_band and anchor is not None:
+            new_band = ((anchor == 0) != (size == 0)) or bool(size and anchor / size < .95)
+        if new_band or anchor is None:
+            group += 1
+            extension, anchor = current_extension, size
+        path = document['path']
+        ranks[path], groups[path] = len(ranks), group
+        if size_only(document):
+            notes[path] = ('Только тип и размер: файл >128 МиБ, содержимое не проверялось; '
+                           'группа с разбросом размера до 5%. Не подтверждённый дубль.')
+        elif document.get('content', {}).get('failed') or not document.get('content', {}).get('sha256'):
+            notes[path] = ('Содержимое не проанализировано; расположен в конце только по типу и размеру. '
+                           'Не подтверждённый дубль.')
+        else:
+            notes[path] = ('Совпадений по содержимому выше порога не найдено; расположен в конце только по типу '
+                           'и размеру. Не подтверждённый дубль.')
+    return group + 1
+
+
 def content_order(documents, cancel, progress=lambda count: None):
     # Collapse identical fingerprints, but never collapse unknown/failed files.
     buckets, unknown, large = {}, [], {}
@@ -288,34 +321,36 @@ def content_order(documents, cancel, progress=lambda count: None):
             heapq.heappush(heap, (-score, left, right, generations[left], generations[right]))
         merged += 1
         progress(len(units) + merged)
-    ranks, groups = {}, {}
-    for group, indices in enumerate(sorted(members.values(), key=min)):
+    ranks, groups, unmatched = {}, {}, list(unknown)
+    confirmed = []
+    for indices in members.values():
+        if sum(len(units[i]) for i in indices) > 1:
+            confirmed.append(indices)
+        else:
+            unmatched.extend(units[indices[0]])
+    # Real content matches come first. Larger groups are easier to process in bulk;
+    # format and size only make their block order stable and readable.
+    confirmed.sort(key=lambda indices: (
+        -sum(len(units[i]) for i in indices),
+        min(physical_key(document) for i in indices for document in units[i]),
+        min(indices),
+    ))
+    for group, indices in enumerate(confirmed):
         indices = sorted(indices)
         representative = fingerprints[indices[0]]
-        for i in sorted(indices):
+        cluster_documents = sorted(
+            ((i, document) for i in indices for document in units[i]),
+            key=lambda pair: physical_key(pair[1]),
+        )
+        for i, document in cluster_documents:
             note = evidence(fingerprints[i], representative) if len(indices) > 1 or len(units[i]) > 1 else None
             if i == indices[0] and len(indices) > 1:
                 note = 'Представитель группы: ' + evidence(representative, fingerprints[indices[1]])
-            for document in units[i]:
-                path = document['path']
-                ranks[path], groups[path] = len(ranks), group
-                if note:
-                    notes[path] = note if i == indices[0] else note + ' (с представителем группы)'
-    for offset, document in enumerate(unknown):
-        path = document['path']
-        ranks[path], groups[path] = len(ranks), len(members) + offset
-        notes[path] = 'Содержимое не проанализировано; оставлен отдельно'
-    group = len(members) + len(unknown) - 1
-    for extension in sorted(large):
-        anchor = None
-        for document in sorted(large[extension], key=lambda d: d['size']):
-            if cancel.is_set():
-                return None
-            size = document['size']
-            if anchor is None or anchor / size < .95:
-                group += 1
-                anchor = size
             path = document['path']
             ranks[path], groups[path] = len(ranks), group
-            notes[path] = 'Только размер и расширение: разброс до 5%; содержимое не проверялось в этом проходе (файл >128 МиБ). Не подтверждённые дубли.'
+            if note:
+                notes[path] = note if i == indices[0] else note + ' (с представителем группы)'
+    unmatched.extend(document for extension in large.values() for document in extension)
+    if append_physical_groups(unmatched, ranks, groups, notes, len(confirmed), cancel) is None:
+        return None
     return ranks, groups, notes

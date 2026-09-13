@@ -21,7 +21,7 @@ class ContentTests(unittest.TestCase):
         self.assertEqual(groups['a.rst'], groups['unrelated.RST'])
         self.assertNotEqual(groups['a.rst'], groups['a.zip'])
         self.assertNotEqual(groups['a.rst'], groups['b.rst'])
-        self.assertTrue(all('Только размер' in note for note in notes.values()))
+        self.assertTrue(all('Только тип и размер' in note for note in notes.values()))
 
     def test_large_skip_and_cache_reset_preserve_structure_and_hash(self):
         self.put('a.zip', b'synthetic archive')
@@ -31,7 +31,7 @@ class ContentTests(unittest.TestCase):
             with patch('corpuspick.content_similarity.MAX_CONTENT_BYTES', 4), \
                  patch('corpuspick.stats_worker.StatsWorker.count', side_effect=AssertionError('Must not read large file')):
                 result = session.group_similar()
-                self.assertIn('Только размер', result[2]['a.zip'])
+                self.assertIn('Только тип и размер', result[2]['a.zip'])
             doc = session.state['documents'][0]
             doc.update(content={'sha256': 'synthetic'}, hash='keep', origin='original/a.zip', stats={'pages': 2})
             session.clear_similarity_cache()
@@ -59,9 +59,11 @@ class ContentTests(unittest.TestCase):
         second = [dict(d, path=f'renamed/{9-i}.anything') for i, d in enumerate(first)]
         _, renamed, _ = content_order(list(reversed(second)), threading.Event())
         self.assertEqual([groups[d['path']] for d in first], [renamed[d['path']] for d in second])
-        unknown = [{'path': 'one/report.doc'}, {'path': 'two/report.doc', 'content': {'failed': True}}]
-        _, groups, _ = content_order(unknown, threading.Event())
-        self.assertEqual(len(set(groups.values())), 2)
+        unknown = [{'path': 'one/report.doc', 'size': 100},
+                   {'path': 'two/report.doc', 'size': 102, 'content': {'failed': True}}]
+        _, groups, notes = content_order(unknown, threading.Event())
+        self.assertEqual(len(set(groups.values())), 1)
+        self.assertTrue(all('Содержимое не проанализировано' in note for note in notes.values()))
 
     def test_complete_link_merges_strongest_pair_before_borderline_file(self):
         # A-B=.9, A-C=.97, B-C below threshold: filenames/input order must not
@@ -146,9 +148,27 @@ class ContentTests(unittest.TestCase):
         def match(a, b):
             return (.95, 'test') if {a['sha256'], b['sha256']} == {'0258', '0259'} else None
         with patch('corpuspick.content_similarity.content_match', side_effect=match):
-            _, groups, _ = content_order(docs, threading.Event())
+            ranks, groups, _ = content_order(docs, threading.Event())
         self.assertEqual(groups['258'], groups['259'])
-        self.assertEqual(len(set(groups.values())), 259)
+        self.assertTrue(all(groups[str(i)] != groups['258'] for i in range(258)))
+        self.assertLess(max(ranks['258'], ranks['259']), min(ranks[str(i)] for i in range(258)))
+
+    def test_unmatched_files_are_last_then_ordered_by_format_and_size(self):
+        sizes = [('first.pdf', 56591), ('second.pdf', 56585), ('sheet.xlsx', 94537),
+                 ('third.pdf', 56451), ('far.pdf', 120000)]
+        docs = [{'path': path, 'size': size,
+                 'content': {'sha256': path, 'bytes': size, 'chunks': []}}
+                for path, size in sizes]
+        docs += [{'path': 'copy-a.bin', 'size': 200, 'content': {'sha256': 'same', 'bytes': 200}},
+                 {'path': 'copy-b.bin', 'size': 200, 'content': {'sha256': 'same', 'bytes': 200}}]
+        ranks, groups, notes = content_order(docs, threading.Event())
+        self.assertLess(max(ranks['copy-a.bin'], ranks['copy-b.bin']),
+                        min(ranks[path] for path, _ in sizes))
+        ordered = [path for path, _ in sorted(ranks.items(), key=lambda pair: pair[1])]
+        self.assertEqual(ordered[2:], ['third.pdf', 'second.pdf', 'first.pdf', 'far.pdf', 'sheet.xlsx'])
+        self.assertEqual(groups['third.pdf'], groups['first.pdf'])
+        self.assertNotEqual(groups['third.pdf'], groups['far.pdf'])
+        self.assertTrue(all('расположен в конце' in notes[path] for path, _ in sizes))
 
     def test_session_cache_invalidation_and_exact_delete_separation(self):
         data = random.Random(23).randbytes(4096)
@@ -163,7 +183,7 @@ class ContentTests(unittest.TestCase):
                 session.group_similar()
             b.write_bytes(random.Random(22).randbytes(4096))
             result = session.group_similar()
-            self.assertEqual(len(set(result[1].values())), 2)
+            self.assertTrue(all('выше порога не найдено' in result[2][path.name] for path in (a, b)))
             self.assertEqual(a.read_bytes(), data)
             session.cancel.set()
             self.assertIsNone(session.group_similar())
