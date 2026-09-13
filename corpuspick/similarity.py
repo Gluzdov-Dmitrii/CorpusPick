@@ -1,6 +1,7 @@
 """Local TF-IDF name matching with pairwise-verified groups; no document reads."""
 from collections import Counter, defaultdict
 from functools import lru_cache
+import heapq
 from math import log, sqrt
 from pathlib import Path
 import re
@@ -35,7 +36,8 @@ def _vectors(names, characters=False):
     return vectors
 
 
-def similar_order(documents, cancel, progress=lambda count: None, with_groups=False):
+def similar_order(documents, cancel, progress=lambda count: None, with_groups=False,
+                  exhaustive=False, threshold=.62):
     # Collapse identical normalized names before matching (size/type do not change a name).
     buckets = defaultdict(list)
     for i, d in enumerate(documents):
@@ -51,42 +53,110 @@ def similar_order(documents, cancel, progress=lambda count: None, with_groups=Fa
     @lru_cache(maxsize=8192)
     def score(i, j):
         return .65 * cosine(words[i], words[j]) + .35 * cosine(chars[i], chars[j])
-    postings = defaultdict(list)
-    for i in range(len(names)):
-        for f in [*(('w', f) for f in words[i]), *(('c', f) for f in chars[i])]:
-            postings[f].append(i)
-    clusters, assigned = [], {}
-    for i, name in enumerate(names):
-        if cancel.is_set():
-            return None
-        features = [*(('w', f) for f in words[i]), *(('c', f) for f in chars[i])]
-        candidates = Counter()
-        # Search by rare shared features across the catalog, not lexicographic neighbours.
-        for f in sorted(features, key=lambda f: (len(postings[f]), f))[:24]:
-            if len(postings[f]) <= 512:
-                candidates.update(j for j in postings[f] if j < i)
-        options = sorted(candidates, key=lambda j: (-candidates[j], j))[:64]
-        groups = sorted({assigned[j] for j in options},
-                        key=lambda g: (-score(i, clusters[g][0]), g))
-        chosen = None
-        for g in groups:
-            # Complete compatibility prevents transitive A-B-C chains.
-            compatible = True
-            for j in clusters[g]:
-                if cancel.is_set():
-                    return None
-                if score(i, j) < .62:
-                    compatible = False
+    if exhaustive:
+        # Strongest-pair-first complete-link avoids a weak early filename match
+        # splitting a later, clearly stronger set.
+        if len(names) < 2:
+            clusters = [list(range(len(names)))] if names else []
+        else:
+            try:
+                import numpy as np
+                from scipy.sparse import csr_matrix, hstack
+                from sklearn.cluster import AgglomerativeClustering
+
+                def matrix(vectors):
+                    columns = {feature: column for column, feature in enumerate(
+                        sorted({feature for vector in vectors for feature in vector}))}
+                    rows, cols, values = [], [], []
+                    for row, vector in enumerate(vectors):
+                        for feature, value in vector.items():
+                            rows.append(row)
+                            cols.append(columns[feature])
+                            values.append(value)
+                    return csr_matrix((values, (rows, cols)), shape=(len(vectors), len(columns)))
+
+                combined = hstack((matrix(words) * sqrt(.65), matrix(chars) * sqrt(.35)), format='csr')
+                distances = 1 - (combined @ combined.T).toarray().astype('float32')
+                np.fill_diagonal(distances, 0)
+                labels = AgglomerativeClustering(
+                    n_clusters=None, metric='precomputed', linkage='complete',
+                    distance_threshold=1 - threshold + 1e-7,
+                ).fit_predict(distances)
+                grouped = defaultdict(list)
+                for index, label in enumerate(labels):
+                    grouped[int(label)].append(index)
+                clusters = sorted(grouped.values(), key=lambda members: min(members))
+                progress(len(names))
+            except Exception:
+                # Dependency failure must not make file operations unavailable.
+                adjacency = {i: {} for i in range(len(names))}
+                heap = []
+                for i in range(len(names)):
+                    for j in range(i):
+                        value = score(i, j)
+                        if value >= threshold:
+                            adjacency[i][j] = adjacency[j][i] = value
+                            heapq.heappush(heap, (-value, j, i, 0, 0))
+                    progress(i + 1)
+                members, generations = {i: [i] for i in range(len(names))}, [0] * len(names)
+                while heap:
+                    if cancel.is_set():
+                        return None
+                    negative, a, b, va, vb = heapq.heappop(heap)
+                    if a not in members or b not in members or generations[a] != va or generations[b] != vb:
+                        continue
+                    common = adjacency[a].keys() & adjacency[b].keys()
+                    updated = {c: min(adjacency[a][c], adjacency[b][c]) for c in common}
+                    for c in adjacency[a].keys() | adjacency[b].keys():
+                        adjacency[c].pop(a, None)
+                        adjacency[c].pop(b, None)
+                    adjacency[a] = {}
+                    adjacency.pop(b)
+                    members[a].extend(members.pop(b))
+                    generations[a] += 1
+                    for c, value in updated.items():
+                        adjacency[a][c] = adjacency[c][a] = value
+                        left, right = sorted((a, c))
+                        heapq.heappush(heap, (-value, left, right,
+                                             generations[left], generations[right]))
+                clusters = sorted(members.values(), key=lambda members: min(members))
+    else:
+        postings = defaultdict(list)
+        for i in range(len(names)):
+            for f in [*(('w', f) for f in words[i]), *(('c', f) for f in chars[i])]:
+                postings[f].append(i)
+        clusters, assigned = [], {}
+        for i, name in enumerate(names):
+            if cancel.is_set():
+                return None
+            features = [*(('w', f) for f in words[i]), *(('c', f) for f in chars[i])]
+            candidates = Counter()
+            # Search by rare shared features across the catalog, not lexicographic neighbours.
+            for f in sorted(features, key=lambda f: (len(postings[f]), f))[:24]:
+                if len(postings[f]) <= 512:
+                    candidates.update(j for j in postings[f] if j < i)
+            options = sorted(candidates, key=lambda j: (-candidates[j], j))[:64]
+            groups = sorted({assigned[j] for j in options},
+                            key=lambda g: (-score(i, clusters[g][0]), g))
+            chosen = None
+            for g in groups:
+                # Complete compatibility prevents transitive A-B-C chains.
+                compatible = True
+                for j in clusters[g]:
+                    if cancel.is_set():
+                        return None
+                    if score(i, j) < threshold:
+                        compatible = False
+                        break
+                if compatible:
+                    chosen = g
                     break
-            if compatible:
-                chosen = g
-                break
-        if chosen is None:
-            chosen = len(clusters)
-            clusters.append([])
-        clusters[chosen].append(i)
-        assigned[i] = chosen
-        progress(i + 1)
+            if chosen is None:
+                chosen = len(clusters)
+                clusters.append([])
+            clusters[chosen].append(i)
+            assigned[i] = chosen
+            progress(i + 1)
     ranks, groups = {}, {}
     for group, members in enumerate(clusters):
         entries = [i for member in members for i in buckets[names[member]]]

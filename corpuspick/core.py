@@ -390,7 +390,7 @@ class Session:
                 if self.cancel.is_set():
                     break
                 signature = document.get('content', {})
-                if size_only(document) or signature.get('failed') or signature.get('text_failed'):
+                if size_only(document) or signature.get('failed'):
                     continue
                 if Path(document['path']).suffix.lower() not in TOPIC_SUFFIXES:
                     signature.update(topic_version=TOPIC_VERSION, topic_words=0, topic='')
@@ -415,7 +415,7 @@ class Session:
         self.save()
         if self.cancel.is_set():
             return None
-        return content_order(self.state['documents'], self.cancel, progress, with_map=True)
+        return content_order(self.state['documents'], self.cancel, progress)
 
     def duplicate_plan(self, progress=lambda count: None):
         self.scan(progress)

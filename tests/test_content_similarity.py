@@ -7,7 +7,8 @@ from unittest.mock import patch
 from zipfile import ZipFile, ZIP_DEFLATED, ZIP_STORED
 
 from corpuspick.core import Session
-from corpuspick.content_similarity import fingerprint, evidence, content_order, text_fingerprint, semantic_layout
+from corpuspick.content_similarity import (fingerprint, evidence, content_order, text_fingerprint,
+                                           semantic_layout, visual_similarity, TOPIC_VERSION)
 
 
 class ContentTests(unittest.TestCase):
@@ -31,12 +32,12 @@ class ContentTests(unittest.TestCase):
         self.assertEqual(len(set.union(*topic_labels)), 3)
         self.assertEqual(visual['clusters'], 3)
         self.assertEqual(visual['clustered'], 15)
-        ranks, groups, notes, mapped = content_order(docs, threading.Event(), with_map=True)
+        ranks, groups, notes = content_order(docs, threading.Event())
         grouped = [{groups[f'{group}-{index}.pdf'] for index in range(5)} for group in range(3)]
         self.assertTrue(all(len(group) == 1 for group in grouped))
         self.assertEqual(len(set.union(*grouped)), 3)
         self.assertTrue(all('HDBSCAN' in notes[document['path']] for document in docs))
-        self.assertEqual(len(ranks), len(mapped['points']))
+        self.assertEqual(len(ranks), 15)
 
     def test_existing_fingerprint_adds_only_bounded_topic_pass(self):
         self.put('a.txt', ('искусственный тематический документ ' * 20).encode('utf-8'))
@@ -50,7 +51,7 @@ class ContentTests(unittest.TestCase):
             calls = []
             def count(worker, path, cancel):
                 calls.append(worker.target.__name__)
-                return {'topic_version': 1, 'topic_words': 20,
+                return {'topic_version': TOPIC_VERSION, 'topic_words': 20,
                         'topic': text_fingerprint(['искусственный тематический документ ' * 20])['topic']}
             with patch('corpuspick.stats_worker.StatsWorker.count', count):
                 session.group_similar()
@@ -99,8 +100,7 @@ class ContentTests(unittest.TestCase):
                fingerprint(self.put('c.bin', random.Random(91).randbytes(4096)))]
         first = [{'path': name, 'content': fp} for name, fp in zip(
             ('folder/report.doc', 'different/unknown.pdf', 'other/report.doc'), fps)]
-        with patch('corpuspick.similarity.similar_order', side_effect=AssertionError('No filename grouping')):
-            _, groups, _ = content_order(first, threading.Event())
+        _, groups, _ = content_order(first, threading.Event())
         self.assertEqual(groups[first[0]['path']], groups[first[1]['path']])
         self.assertNotEqual(groups[first[0]['path']], groups[first[2]['path']])
         second = [dict(d, path=f'renamed/{9-i}.anything') for i, d in enumerate(first)]
@@ -110,7 +110,27 @@ class ContentTests(unittest.TestCase):
                    {'path': 'two/report.doc', 'size': 102, 'content': {'failed': True}}]
         _, groups, notes = content_order(unknown, threading.Event())
         self.assertEqual(len(set(groups.values())), 1)
-        self.assertTrue(all('Содержимое не проанализировано' in note for note in notes.values()))
+        self.assertTrue(all('Резервная группа' in note for note in notes.values()))
+
+    def test_residual_name_grouping_only_uses_same_type_and_broad_size_band(self):
+        docs = [
+            {'path': '01 КП поставка насосов.pdf', 'size': 1_000_000,
+             'content': {'sha256': 'a', 'bytes': 1_000_000, 'chunks': []}},
+            {'path': 'КП поставка насосного оборудования.pdf', 'size': 1_450_000,
+             'content': {'sha256': 'b', 'bytes': 1_450_000, 'chunks': []}},
+            {'path': 'КП поставка насосов.xlsx', 'size': 1_100_000,
+             'content': {'sha256': 'c', 'bytes': 1_100_000, 'chunks': []}},
+            {'path': 'КП поставка насосов.pdf', 'size': 3_100_000,
+             'content': {'sha256': 'd', 'bytes': 3_100_000, 'chunks': []}},
+            {'path': 'База данных испытаний.pdf', 'size': 1_050_000,
+             'content': {'sha256': 'e', 'bytes': 1_050_000, 'chunks': []}},
+        ]
+        _, groups, notes = content_order(docs, threading.Event())
+        self.assertEqual(groups[docs[0]['path']], groups[docs[1]['path']])
+        self.assertNotEqual(groups[docs[0]['path']], groups[docs[2]['path']])
+        self.assertNotEqual(groups[docs[0]['path']], groups[docs[3]['path']])
+        self.assertNotEqual(groups[docs[0]['path']], groups[docs[4]['path']])
+        self.assertIn('Резервная группа', notes[docs[0]['path']])
 
     def test_complete_link_merges_strongest_pair_before_borderline_file(self):
         # A-B=.9, A-C=.97, B-C below threshold: filenames/input order must not
@@ -287,3 +307,33 @@ class ContentTests(unittest.TestCase):
         blank.add_blank_page(600, 800)
         blank.write(self.root / 'blank.pdf')
         self.assertEqual(fingerprint(self.root / 'blank.pdf')['words'], 0)
+
+    def test_image_only_pdf_uses_visual_page_fingerprint_without_ocr(self):
+        from PIL import Image, ImageDraw
+        image = Image.new('RGB', (500, 700), 'white')
+        drawing = ImageDraw.Draw(image)
+        drawing.rectangle((40, 30, 460, 120), fill='black')
+        for row in range(8):
+            drawing.rectangle((55, 180 + row * 45, 420 - row * 7, 193 + row * 45), fill='black')
+        first_path, second_path = self.root / 'scan-a.pdf', self.root / 'scan-b.pdf'
+        image.save(first_path, 'PDF', resolution=150, quality=82)
+        image.save(second_path, 'PDF', resolution=150, quality=96)
+        first, second = fingerprint(first_path), fingerprint(second_path)
+        self.assertEqual(first['words'], 0)
+        self.assertTrue(first['visual'])
+        self.assertGreaterEqual(visual_similarity(first, second), .88)
+        self.assertIn('Визуально близкие страницы PDF без OCR', evidence(first, second))
+        other = Image.new('RGB', (500, 700), 'white')
+        other_drawing = ImageDraw.Draw(other)
+        other_drawing.ellipse((80, 120, 420, 580), fill='black')
+        other_path = self.root / 'scan-c.pdf'
+        other.save(other_path, 'PDF', resolution=150)
+        third = fingerprint(other_path)
+        documents = [
+            {'path': path.name, 'size': path.stat().st_size, 'content': signature}
+            for path, signature in ((first_path, first), (second_path, second), (other_path, third))
+        ]
+        _, groups, notes = content_order(documents, threading.Event())
+        self.assertEqual(groups['scan-a.pdf'], groups['scan-b.pdf'])
+        self.assertNotEqual(groups['scan-a.pdf'], groups['scan-c.pdf'])
+        self.assertIn('Визуально близкие страницы PDF без OCR', notes['scan-a.pdf'])

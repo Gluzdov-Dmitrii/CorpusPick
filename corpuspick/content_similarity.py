@@ -14,12 +14,13 @@ import zlib
 from zipfile import ZipFile
 
 VERSION = 1
-TOPIC_VERSION = 1
+TOPIC_VERSION = 2
 LIMIT = 256
 TOPIC_DIMENSIONS = 8192
 TOPIC_WORD_LIMIT = 3000
 MAX_CONTENT_BYTES = 128 * 1024 * 1024
 TOPIC_SUFFIXES = ('.docx', '.pdf', '.txt', '.md', '.csv', '.tsv')
+VISUAL_VERSION = 1
 
 
 def size_only(document):
@@ -158,7 +159,7 @@ def text_fingerprint(parts, topic_only=False):
     return topic
 
 
-def text_parts(path):
+def text_parts(path, max_pages=None):
     suffix = path.suffix.lower()
     if suffix == '.docx':
         from .statistics import xml_part, W
@@ -176,7 +177,9 @@ def text_parts(path):
             reader = PdfReader(stream, strict=False)
             if reader.is_encrypted and not reader.decrypt(''):
                 raise ValueError('Encrypted')
-            for page in reader.pages:
+            for index, page in enumerate(reader.pages):
+                if max_pages is not None and index >= max_pages:
+                    break
                 yield page.extract_text() or ''
     elif suffix in ('.txt', '.md', '.csv', '.tsv'):
         # Explicit Unicode/BOM detection, then legacy Russian text. No lossy decoding.
@@ -194,12 +197,65 @@ def text_parts(path):
 
 def extracted_fingerprint(path, topic_only=False):
     try:
-        return text_fingerprint(text_parts(path), topic_only=topic_only)
+        return text_fingerprint(text_parts(path, max_pages=12 if topic_only else None), topic_only=topic_only)
     except UnicodeError:
         if path.suffix.lower() not in ('.txt', '.md', '.csv', '.tsv'):
             raise
         with open(path, encoding='cp1251') as stream:
             return text_fingerprint(stream, topic_only=topic_only)
+
+
+def _perceptual_hash(image):
+    """512-bit average+difference hash; decoded pixels, not compressed bytes."""
+    from PIL import Image, ImageOps
+    image = ImageOps.exif_transpose(image).convert('L')
+    average_image = image.resize((16, 16), Image.Resampling.LANCZOS)
+    flattened = getattr(average_image, 'get_flattened_data', None)
+    pixels = list(flattened() if flattened else average_image.getdata())
+    mean = sum(pixels) / len(pixels)
+    average_bits = ''.join('1' if value > mean else '0' for value in pixels)
+    difference_image = image.resize((17, 16), Image.Resampling.LANCZOS)
+    flattened = getattr(difference_image, 'get_flattened_data', None)
+    pixels = list(flattened() if flattened else difference_image.getdata())
+    difference_bits = ''.join(
+        '1' if pixels[row * 17 + column] > pixels[row * 17 + column + 1] else '0'
+        for row in range(16) for column in range(16)
+    )
+    bits = average_bits + difference_bits
+    return f'{int(bits, 2):0128x}', round(mean), round(image.width / max(image.height, 1), 3)
+
+
+def pdf_visual_fingerprint(path):
+    """Hash the largest embedded image on first/middle/last PDF pages without OCR."""
+    from pypdf import PdfReader
+    logging.getLogger('pypdf').setLevel(logging.CRITICAL)
+    result = {'visual_version': VISUAL_VERSION, 'visual_pages': 0, 'visual': []}
+    with open(path, 'rb') as stream:
+        reader = PdfReader(stream, strict=False)
+        if reader.is_encrypted and not reader.decrypt(''):
+            raise ValueError('Encrypted')
+        total = len(reader.pages)
+        result['visual_pages'] = total
+        positions = [('first', 0), ('middle', total // 2), ('last', total - 1)] if total else []
+        seen = set()
+        for slot, index in positions:
+            if index in seen:
+                continue
+            seen.add(index)
+            page = reader.pages[index]
+            largest = None
+            for key in list(page.images.keys())[:32]:
+                try:
+                    candidate = page.images[key].image
+                    if candidate is not None and (largest is None or candidate.width * candidate.height > largest.width * largest.height):
+                        largest = candidate.copy()
+                except Exception:
+                    continue
+            if largest is not None:
+                fingerprint, tone, aspect = _perceptual_hash(largest)
+                result['visual'].append({'slot': slot, 'hash': fingerprint,
+                                         'tone': tone, 'aspect': aspect})
+    return result
 
 
 def fingerprint(path):
@@ -211,11 +267,18 @@ def fingerprint(path):
         try:
             text = extracted_fingerprint(path)
             result.update(text)
+            if path.suffix.lower() == '.pdf' and text['words'] < 20:
+                result.update(pdf_visual_fingerprint(path))
             result['info'] = ('Байты и извлечённый текст; изображения и вёрстка текстом не сравниваются'
                               if text['words'] >= 10 else 'Байты прочитаны; недостаточно текста для сравнения (OCR не выполнялся)')
         except Exception:
             result['text_failed'] = True
             result['info'] = 'Байты прочитаны; текст извлечь не удалось'
+            if path.suffix.lower() == '.pdf':
+                try:
+                    result.update(pdf_visual_fingerprint(path))
+                except Exception:
+                    result['visual_failed'] = True
     return result
 
 
@@ -232,7 +295,16 @@ def topic_worker(connection):
                     if source.suffix.lower() not in TOPIC_SUFFIXES:
                         result = {'topic_version': TOPIC_VERSION, 'topic_words': 0, 'topic': ''}
                     else:
-                        result = extracted_fingerprint(source, topic_only=True)
+                        try:
+                            result = extracted_fingerprint(source, topic_only=True)
+                        except Exception:
+                            result = {'topic_version': TOPIC_VERSION, 'topic_words': 0, 'topic': '',
+                                      'topic_failed': True}
+                        if source.suffix.lower() == '.pdf' and result.get('topic_words', 0) < 20:
+                            try:
+                                result.update(pdf_visual_fingerprint(source))
+                            except Exception:
+                                result['visual_failed'] = True
                 except Exception:
                     result = {'topic_version': TOPIC_VERSION, 'topic_failed': True,
                               'info': 'Тематические признаки извлечь не удалось'}
@@ -269,12 +341,48 @@ def overlap(a, b):
     return sum(v in a and v in b for v in sampled) / len(sampled)
 
 
+def visual_similarity(a, b):
+    left = {item['slot']: item for item in a.get('visual', [])}
+    right = {item['slot']: item for item in b.get('visual', [])}
+    common = sorted(left.keys() & right.keys())
+    if not common:
+        return 0.0
+    if min(a.get('visual_pages', 0), b.get('visual_pages', 0)):
+        ratio = min(a['visual_pages'], b['visual_pages']) / max(a['visual_pages'], b['visual_pages'])
+        if ratio < .8:
+            return 0.0
+    scores = []
+    for slot in common:
+        first, second = left[slot], right[slot]
+        if abs(first['aspect'] - second['aspect']) > .12 or abs(first['tone'] - second['tone']) > 40:
+            return 0.0
+        distance = (int(first['hash'], 16) ^ int(second['hash'], 16)).bit_count()
+        scores.append(1 - distance / 512)
+    if (max(len(left), len(right)) > 1 and len(common) < 2) or min(scores) < .80:
+        return 0.0
+    return sum(scores) / len(scores)
+
+
+def visual_index_keys(fp):
+    keys = []
+    for item in fp.get('visual', []):
+        value = item.get('hash', '')
+        if len(value) != 128:
+            continue
+        for band in range(32):
+            keys.append(('v', item['slot'], band, value[band * 4:(band + 1) * 4]))
+    return keys
+
+
 def content_match(a, b):
     if not a or not b or a.get('failed') or b.get('failed'):
         return None
     if a.get('sha256') and a['sha256'] == b.get('sha256'):
         return 1.01, 'Точные байты (SHA-256)'
     matches = []
+    score = visual_similarity(a, b)
+    if score >= .88:
+        matches.append((score, f'Визуально близкие страницы PDF без OCR: ≈{score:.0%} совпадения отпечатков'))
     if min(a.get('words', 0), b.get('words', 0)) >= 10:
         ratio = min(a['words'], b['words']) / max(a['words'], b['words'])
         score = 1.0 if a['text_sha256'] == b['text_sha256'] else overlap(a.get('text', []), b.get('text', []))
@@ -297,7 +405,8 @@ def evidence(a, b):
 
 def fingerprint_key(fp):
     # Only content-derived fields determine processing order / identical units.
-    fields = ('sha256', 'text_sha256', 'words', 'bytes', 'binary_method', 'binary', 'chunks', 'text')
+    fields = ('sha256', 'text_sha256', 'words', 'bytes', 'binary_method', 'binary', 'chunks', 'text',
+              'visual_version', 'visual_pages', 'visual')
     return json.dumps({k: fp.get(k) for k in fields}, sort_keys=True, separators=(',', ':'))
 
 
@@ -309,13 +418,12 @@ def semantic_layout(documents, cancel):
                   and document.get('content', {}).get('topic_words', 0) >= 20
                   and document.get('content', {}).get('topic')]
     if len(candidates) < 5 or cancel.is_set():
-        return {}, {'points': [], 'clusters': 0, 'clustered': 0, 'eligible': len(candidates)}
+        return {}, {'clusters': 0, 'clustered': 0, 'eligible': len(candidates)}
     try:
         import numpy as np
         from sklearn.cluster import HDBSCAN
         from sklearn.decomposition import TruncatedSVD
         from sklearn.feature_extraction.text import TfidfTransformer
-        from sklearn.metrics import silhouette_score
         from sklearn.preprocessing import normalize
 
         # Exact topic vectors must not distort density merely because copies exist.
@@ -332,7 +440,7 @@ def semantic_layout(documents, cancel):
                 raise ValueError('Invalid topic vector')
             rows.append(row)
         if len(rows) < 5:
-            return {}, {'points': [], 'clusters': 0, 'clustered': 0, 'eligible': len(candidates)}
+            return {}, {'clusters': 0, 'clustered': 0, 'eligible': len(candidates)}
         matrix = np.stack(rows)
         tfidf = TfidfTransformer(sublinear_tf=True).fit_transform(matrix)
         dimensions = min(64, len(rows) - 1, TOPIC_DIMENSIONS - 1)
@@ -341,26 +449,18 @@ def semantic_layout(documents, cancel):
         model = HDBSCAN(min_cluster_size=5, min_samples=2, copy=True,
                         cluster_selection_method='eom', allow_single_cluster=False).fit(embedding)
         labels, probabilities = model.labels_, model.probabilities_
-        result, points = {}, []
+        result = {}
         for index, key in enumerate(keys):
             label, probability = int(labels[index]), float(probabilities[index])
-            x = float(embedding[index, 0]) if dimensions else 0.0
-            y = float(embedding[index, 1]) if dimensions > 1 else 0.0
             for document in vectors[key]:
                 path = document['path']
                 result[path] = (label, probability)
-                points.append({'path': path, 'x': x, 'y': y, 'label': label,
-                               'confidence': probability})
         cluster_labels = {label for label in labels if label >= 0}
-        clustered_mask = labels >= 0
-        quality = None
-        if len(cluster_labels) > 1 and clustered_mask.sum() > len(cluster_labels):
-            quality = float(silhouette_score(embedding[clustered_mask], labels[clustered_mask]))
-        return result, {'points': points, 'clusters': len(cluster_labels),
-                        'clustered': sum(item['label'] >= 0 for item in points),
-                        'eligible': len(candidates), 'quality': quality}
+        return result, {'clusters': len(cluster_labels),
+                        'clustered': sum(label >= 0 for label, _ in result.values()),
+                        'eligible': len(candidates)}
     except Exception:
-        return {}, {'points': [], 'clusters': 0, 'clustered': 0, 'eligible': len(candidates),
+        return {}, {'clusters': 0, 'clustered': 0, 'eligible': len(candidates),
                     'error': 'ML-кластеризация недоступна'}
 
 
@@ -397,7 +497,62 @@ def append_physical_groups(documents, ranks, groups, notes, first_group, cancel)
     return group + 1
 
 
-def content_order(documents, cancel, progress=lambda count: None, with_map=False):
+def append_residual_name_groups(documents, ranks, groups, notes, first_group, cancel):
+    """Use names only for files left ungrouped by content.
+
+    Partitions never mix formats and span at most 2x in size.  This last-resort
+    stage cannot change a content or ML group because it only receives the
+    unmatched remainder.
+    """
+    from .similarity import similar_order
+
+    partitions, current, extension, anchor = [], [], None, None
+    for document in sorted(documents, key=physical_key):
+        if cancel.is_set():
+            return None
+        current_extension, size = physical_key(document)
+        new_partition = current_extension != extension
+        if not new_partition and anchor is not None:
+            new_partition = ((anchor == 0) != (size == 0)) or bool(size and anchor / size < .5)
+        if new_partition:
+            if current:
+                partitions.append(current)
+            current, extension, anchor = [], current_extension, size
+        elif anchor is None:
+            extension, anchor = current_extension, size
+        current.append(document)
+    if current:
+        partitions.append(current)
+
+    accepted, remaining = [], []
+    for partition in partitions:
+        if cancel.is_set():
+            return None
+        result = similar_order(partition, cancel, with_groups=True,
+                               exhaustive=len(partition) <= 4000, threshold=.4)
+        if result is None:
+            return None
+        _, local_groups = result
+        buckets = defaultdict(list)
+        for document in partition:
+            buckets[local_groups[document['path']]].append(document)
+        for bucket in buckets.values():
+            (accepted if len(bucket) > 1 else remaining).append(bucket)
+
+    accepted.sort(key=lambda bucket: (-len(bucket), min(physical_key(document) for document in bucket),
+                                      min(document['path'].casefold() for document in bucket)))
+    group = first_group
+    for bucket in accepted:
+        for document in sorted(bucket, key=lambda item: (item['path'].casefold(), physical_key(item))):
+            path = document['path']
+            ranks[path], groups[path] = len(ranks), group
+            notes[path] = ('Резервная группа: похожее название, одинаковый формат и размер в пределах 2×; '
+                           'содержимое не подтвердило общую тему или дубль.')
+        group += 1
+    return [document for bucket in remaining for document in bucket], group
+
+
+def content_order(documents, cancel, progress=lambda count: None):
     # Collapse identical fingerprints, but never collapse unknown/failed files.
     buckets, unknown, large = {}, [], {}
     for document in documents:
@@ -420,6 +575,7 @@ def content_order(documents, cancel, progress=lambda count: None, with_map=False
             return None
         keys = [('b', h) for h in fp.get('binary', [])] + [('t', h) for h in fp.get('text', [])]
         keys += [('c', h) for h in fp.get('chunks', [])]
+        keys += visual_index_keys(fp)
         keys += [(k, fp[k]) for k in ('sha256', 'text_sha256') if fp.get(k) and (k != 'text_sha256' or fp.get('words', 0) >= 10)]
         candidates = set()
         for key in keys:
@@ -461,7 +617,7 @@ def content_order(documents, cancel, progress=lambda count: None, with_map=False
             heapq.heappush(heap, (-score, left, right, generations[left], generations[right]))
         merged += 1
         progress(len(units) + merged)
-    semantic, visual = semantic_layout(documents, cancel)
+    semantic, _ = semantic_layout(documents, cancel)
     if cancel.is_set():
         return None
 
@@ -535,7 +691,10 @@ def content_order(documents, cancel, progress=lambda count: None, with_map=False
             if reasons:
                 notes[path] = ' · '.join(reasons)
     unmatched.extend(document for extension in large.values() for document in extension)
-    if append_physical_groups(unmatched, ranks, groups, notes, len(confirmed), cancel) is None:
+    residual = append_residual_name_groups(unmatched, ranks, groups, notes, len(confirmed), cancel)
+    if residual is None:
         return None
-    result = ranks, groups, notes
-    return result + (visual,) if with_map else result
+    unmatched, next_group = residual
+    if append_physical_groups(unmatched, ranks, groups, notes, next_group, cancel) is None:
+        return None
+    return ranks, groups, notes

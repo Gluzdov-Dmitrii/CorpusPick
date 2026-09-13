@@ -33,21 +33,6 @@ class GuiSmokeTest(unittest.TestCase):
                 app.session = Session(root, Path(directory) / 'state', read_only=True)
                 app.scan()
                 settle()
-                self.assertEqual(str(app.map_button.cget('state')), 'disabled')
-                app.similarity_map = {'points': [
-                    {'path': 'a.txt', 'x': 0.1, 'y': 0.2, 'label': 0, 'confidence': .9},
-                    {'path': 'b.txt', 'x': 0.8, 'y': 0.7, 'label': -1, 'confidence': 0},
-                ], 'clusters': 1, 'clustered': 1, 'eligible': 2, 'quality': None}
-                app.refresh_controls()
-                self.assertEqual(str(app.map_button.cget('state')), 'normal')
-                app.show_similarity_map()
-                window.update()
-                self.assertTrue(app.map_window.winfo_exists())
-                app.select_map_point('a.txt')
-                self.assertEqual(app.tree.selection(), ('a.txt',))
-                app.map_window.destroy()
-                app.similarity_map = {}
-                app.refresh_controls()
                 self.assertEqual(str(app.tree.cget('selectmode')), 'extended')
                 self.assertFalse(hasattr(app, 'tools_menu'))
                 self.assertIn('pages', app.tree['columns'])
@@ -124,6 +109,10 @@ class GuiSmokeTest(unittest.TestCase):
                 self.assertNotEqual(app.similarity_groups['report 2024.pdf'], app.similarity_groups['letter x.txt'])
                 app.sort('size')
                 self.assertEqual(app.tree.get_children(), ('report 2025.pdf', 'report 2024.pdf', 'letter y.txt', 'letter x.txt'))
+                report_tag = app.tree.item('report 2024.pdf', 'tags')
+                self.assertTrue(report_tag and report_tag[0].startswith('group-'))
+                self.assertEqual(report_tag, app.tree.item('report 2025.pdf', 'tags'))
+                self.assertNotEqual(report_tag, app.tree.item('letter x.txt', 'tags'))
                 app.sort('size')
                 self.assertEqual(app.tree.get_children(), ('report 2024.pdf', 'report 2025.pdf', 'letter x.txt', 'letter y.txt'))
                 app.sort_similar()
