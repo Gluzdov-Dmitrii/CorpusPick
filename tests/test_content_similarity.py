@@ -7,10 +7,57 @@ from unittest.mock import patch
 from zipfile import ZipFile, ZIP_DEFLATED, ZIP_STORED
 
 from corpuspick.core import Session
-from corpuspick.content_similarity import fingerprint, evidence, content_order
+from corpuspick.content_similarity import fingerprint, evidence, content_order, text_fingerprint, semantic_layout
 
 
 class ContentTests(unittest.TestCase):
+    def test_hdbscan_separates_synthetic_document_topics(self):
+        themes = [
+            'коммерческое предложение поставка оборудование цена стоимость заказчик условия договор срок оплаты',
+            'база данных геометрические характеристики испытания образцов материалы результаты таблица реестр',
+            'служебная записка совещание поручение исполнение ответственный решение срок контроль',
+        ]
+        docs = []
+        variants = ['спецификация', 'приложение', 'комплект', 'описание', 'согласование']
+        for group, theme in enumerate(themes):
+            for index in range(5):
+                variant = ' ' + variants[index]
+                content = {'sha256': f'{group}-{index}'}
+                content.update(text_fingerprint([(theme + variant) * 8]))
+                docs.append({'path': f'{group}-{index}.pdf', 'size': 1000 + index, 'content': content})
+        labels, visual = semantic_layout(docs, threading.Event())
+        topic_labels = [{labels[f'{group}-{index}.pdf'][0] for index in range(5)} for group in range(3)]
+        self.assertTrue(all(len(group) == 1 and -1 not in group for group in topic_labels), topic_labels)
+        self.assertEqual(len(set.union(*topic_labels)), 3)
+        self.assertEqual(visual['clusters'], 3)
+        self.assertEqual(visual['clustered'], 15)
+        ranks, groups, notes, mapped = content_order(docs, threading.Event(), with_map=True)
+        grouped = [{groups[f'{group}-{index}.pdf'] for index in range(5)} for group in range(3)]
+        self.assertTrue(all(len(group) == 1 for group in grouped))
+        self.assertEqual(len(set.union(*grouped)), 3)
+        self.assertTrue(all('HDBSCAN' in notes[document['path']] for document in docs))
+        self.assertEqual(len(ranks), len(mapped['points']))
+
+    def test_existing_fingerprint_adds_only_bounded_topic_pass(self):
+        self.put('a.txt', ('искусственный тематический документ ' * 20).encode('utf-8'))
+        session = Session(self.root, self.base / 'state', read_only=True)
+        try:
+            session.open_catalog()
+            document = session.state['documents'][0]
+            document['content'] = {'version': 1, 'sha256': 'cached', 'bytes': document['size'],
+                                   'binary': [], 'chunks': [], 'words': 20,
+                                   'text_sha256': 'cached-text', 'text': []}
+            calls = []
+            def count(worker, path, cancel):
+                calls.append(worker.target.__name__)
+                return {'topic_version': 1, 'topic_words': 20,
+                        'topic': text_fingerprint(['искусственный тематический документ ' * 20])['topic']}
+            with patch('corpuspick.stats_worker.StatsWorker.count', count):
+                session.group_similar()
+            self.assertEqual(calls, ['topic_worker'])
+        finally:
+            session.close()
+
     def test_large_files_group_only_by_size_and_extension_without_chain(self):
         from corpuspick.content_similarity import MAX_CONTENT_BYTES, size_only
         self.assertFalse(size_only({'size': MAX_CONTENT_BYTES}))

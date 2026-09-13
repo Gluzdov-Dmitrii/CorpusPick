@@ -356,7 +356,8 @@ class Session:
         self.save()
 
     def group_similar(self, progress=lambda count: None):
-        from .content_similarity import VERSION, content_worker, content_order, size_only
+        from .content_similarity import (VERSION, TOPIC_VERSION, TOPIC_SUFFIXES, content_worker,
+                                         content_order, size_only, topic_worker)
         from .stats_worker import StatsWorker
         self.scan(progress, hash_files=False)
         last_save = time.monotonic()
@@ -367,7 +368,7 @@ class Session:
                 signature = document.get('content', {})
                 try:
                     path = self.checked_document(document)
-                    if not size_only(document) and (signature.get('version') != VERSION or signature.get('failed') or signature.get('text_failed')):
+                    if not size_only(document) and signature.get('version') != VERSION:
                         signature = worker.count(path, self.cancel)
                         self.checked_document(document)
                         document['content'] = signature
@@ -376,7 +377,36 @@ class Session:
                 except Cancelled:
                     break
                 except (OSError, ValueError):
-                    document.update(content={'failed': True, 'info': 'Файл недоступен или изменился во время анализа'}, hash='')
+                    document.update(content={'version': VERSION, 'failed': True,
+                                             'info': 'Файл недоступен или изменился во время анализа; повтор — после сброса кэша'}, hash='')
+                progress(index + 1)
+                if time.monotonic() - last_save > 5:
+                    self.save()
+                    last_save = time.monotonic()
+        # Existing byte/text fingerprints remain valid. Add the bounded thematic
+        # vector without rereading all bytes or every page.
+        with StatsWorker(timeout=45, target=topic_worker, retry_label='По похожести') as worker:
+            for index, document in enumerate(self.state['documents']):
+                if self.cancel.is_set():
+                    break
+                signature = document.get('content', {})
+                if size_only(document) or signature.get('failed') or signature.get('text_failed'):
+                    continue
+                if Path(document['path']).suffix.lower() not in TOPIC_SUFFIXES:
+                    signature.update(topic_version=TOPIC_VERSION, topic_words=0, topic='')
+                    continue
+                if signature.get('topic_version') == TOPIC_VERSION:
+                    continue
+                try:
+                    path = self.checked_document(document)
+                    topic = worker.count(path, self.cancel)
+                    self.checked_document(document)
+                    signature.update(topic)
+                except Cancelled:
+                    break
+                except (OSError, ValueError):
+                    signature.update(topic_version=TOPIC_VERSION, topic_failed=True,
+                                     info='Тематические признаки недоступны: файл изменился')
                 progress(index + 1)
                 if time.monotonic() - last_save > 5:
                     self.save()
@@ -385,7 +415,7 @@ class Session:
         self.save()
         if self.cancel.is_set():
             return None
-        return content_order(self.state['documents'], self.cancel, progress)
+        return content_order(self.state['documents'], self.cancel, progress, with_map=True)
 
     def duplicate_plan(self, progress=lambda count: None):
         self.scan(progress)

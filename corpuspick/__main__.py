@@ -1,5 +1,6 @@
 """Local folder workbench: portable structure, selection statistics and safe stop."""
 import copy
+import colorsys
 import os
 from pathlib import Path
 import queue
@@ -42,6 +43,7 @@ class App:
         self.column_filters = {}
         self.similarity_notes = {}
         self.similarity_identities = {}
+        self.similarity_map = {}
         self.search, self.filter = tk.StringVar(), tk.StringVar(value='Все файлы')
         self.backup_mode = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value='Откройте каталог. Для нетронутого бэкапа сначала включите режим «Бэкап».')
@@ -87,7 +89,8 @@ class App:
         ttk.Entry(filters, textvariable=self.search).grid(row=0, column=1, sticky='ew')
         ttk.Combobox(filters, textvariable=self.filter, state='readonly', width=19,
                      values=['Все файлы', 'Точные дубли', 'Есть ошибки']).grid(row=0, column=2, padx=(8, 0))
-        for column, label, fn in [(3, 'По похожести', self.sort_similar), (4, 'Убрать префикс', self.trim_names)]:
+        for column, label, fn in [(3, 'По похожести', self.sort_similar), (4, 'Карта групп', self.show_similarity_map),
+                                  (5, 'Убрать префикс', self.trim_names)]:
             button = ttk.Button(filters, text=label, command=fn)
             button.grid(row=0, column=column, padx=(8, 0))
             self.buttons.append(button)
@@ -95,6 +98,8 @@ class App:
                 self.similarity_button = button
                 button.bind('<Button-3>', self.similarity_menu)
             if column == 4:
+                self.map_button = button
+            if column == 5:
                 self.mutation_buttons.append(button)
         listing = ttk.Frame(window, padding=(10, 0))
         listing.grid(row=3, column=0, sticky='nsew')
@@ -160,6 +165,7 @@ class App:
         self.stop_button.configure(state='normal' if self.busy else 'disabled')
         pending = self.session and any(not m['done'] for m in self.session.state['moves'])
         self.reset_button.configure(state='normal' if pending and not self.busy and not self.session.read_only else 'disabled')
+        self.map_button.configure(state='normal' if self.session and not self.busy and self.similarity_map.get('points') else 'disabled')
 
     def run(self, label, function, done=None):
         if self.busy:
@@ -241,6 +247,7 @@ class App:
         self.column_filters = {}
         self.similarity_groups = {}
         self.similarity_ranks = {}
+        self.similarity_map = {}
         self.similarity_button.configure(text='По похожести')
         self.sort_column, self.sort_reverse = 'number', False
         self.view_docs = []
@@ -257,14 +264,14 @@ class App:
         self.view_docs = copy.deepcopy(self.session.state['documents'])
         current = {d['path']: d.get('identity') for d in self.view_docs}
         if self.similarity_groups and current != self.similarity_identities:
-            self.similarity_groups, self.similarity_ranks, self.similarity_notes = {}, {}, {}
+            self.similarity_groups, self.similarity_ranks, self.similarity_notes, self.similarity_map = {}, {}, {}, {}
             self.similarity_button.configure(text='По похожести')
             if self.sort_column == 'similarity':
                 self.sort_column, self.sort_reverse = 'number', False
         docs = self.view_docs
         pending = sum(not m['done'] for m in self.session.state['moves'])
         self.status.set(f"Файлов: {len(docs)} · SHA-256: {sum(bool(d.get('hash')) for d in docs)}/{len(docs)} · "
-                        f"Ошибок: {sum(bool(d.get('error') or d.get('stats', {}).get('failed') or d.get('content', {}).get('failed') or d.get('content', {}).get('text_failed')) for d in docs)}" +
+                        f"Ошибок: {sum(bool(d.get('error') or d.get('stats', {}).get('failed') or d.get('content', {}).get('failed') or d.get('content', {}).get('text_failed') or d.get('content', {}).get('topic_failed')) for d in docs)}" +
                         (' · БЭКАП: файлы не изменяются' if self.session.read_only else ' · Unlock автоматически') +
                         (f' · Не перенесено: {pending}' if pending else '') +
                         (' · Остановлено, прогресс сохранён' if self.session.cancel.is_set() else ''))
@@ -298,7 +305,7 @@ class App:
             if self.search.get().casefold() not in (d['path'] + ' ' + ' '.join(origins)).casefold():
                 continue
             f = self.filter.get()
-            if f == 'Точные дубли' and not d.get('duplicate') or f == 'Есть ошибки' and not (d.get('error') or d.get('stats', {}).get('failed') or d.get('content', {}).get('failed') or d.get('content', {}).get('text_failed')):
+            if f == 'Точные дубли' and not d.get('duplicate') or f == 'Есть ошибки' and not (d.get('error') or d.get('stats', {}).get('failed') or d.get('content', {}).get('failed') or d.get('content', {}).get('text_failed') or d.get('content', {}).get('topic_failed')):
                 continue
             stats = d.get('stats', {})
             def metric(name):
@@ -353,6 +360,9 @@ class App:
         if hasattr(self, 'similarity_context'):
             self.similarity_context.destroy()
         menu = self.similarity_context = tk.Menu(self.window, tearoff=False)
+        menu.add_command(label='Карта групп', command=self.show_similarity_map,
+                         state='normal' if self.similarity_map.get('points') else 'disabled')
+        menu.add_separator()
         menu.add_command(label='Сбросить кэш похожести', command=self.clear_similarity_cache)
         try:
             menu.tk_popup(event.x_root, event.y_root)
@@ -365,7 +375,7 @@ class App:
         if not messagebox.askyesno('Кэш похожести', 'Удалить отпечатки содержимого для текущего каталога?\nИсходные пути, CSV, SHA точных дублей и статистика сохранятся.\nСледующее сравнение заново прочитает файлы до 128 МиБ.'):
             return
         def done(_):
-            self.similarity_notes, self.similarity_groups, self.similarity_ranks = {}, {}, {}
+            self.similarity_notes, self.similarity_groups, self.similarity_ranks, self.similarity_map = {}, {}, {}, {}
             self.similarity_button.configure(text='По похожести')
             self.sort_column, self.sort_reverse = 'number', False
             self.refreshed()
@@ -385,18 +395,74 @@ class App:
             return
         def done(ranks):
             if ranks is not None:
-                self.similarity_ranks, self.similarity_groups, self.similarity_notes = ranks
+                if len(ranks) == 4:
+                    self.similarity_ranks, self.similarity_groups, self.similarity_notes, self.similarity_map = ranks
+                else:  # Compatibility with older session/test providers.
+                    self.similarity_ranks, self.similarity_groups, self.similarity_notes = ranks
+                    self.similarity_map = {}
                 self.similarity_identities = {d['path']: d.get('identity') for d in self.view_docs}
                 self.similarity_button.configure(text='Снять группировку')
                 self.sort_column, self.sort_reverse = 'similarity', False
                 self.render()
-                unavailable = sum(bool(d.get('content', {}).get('failed') or d.get('content', {}).get('text_failed')) for d in self.view_docs)
+                unavailable = sum(bool(d.get('content', {}).get('failed') or d.get('content', {}).get('text_failed') or d.get('content', {}).get('topic_failed')) for d in self.view_docs)
                 from .content_similarity import size_only
                 large = sum(size_only(d) for d in self.view_docs)
-                self.status.set(f'Подтверждённые содержанием группы — сначала; остальные — в конце по типу и размеру · '
+                ml = self.similarity_map
+                ml_text = ('ML-кластеризация недоступна: установите зависимости · ' if ml.get('error') else
+                           f"ML-тем: {ml.get('clusters', 0)} · В темах: {ml.get('clustered', 0)}/{ml.get('eligible', 0)} · "
+                           if ml.get('eligible') else '')
+                self.status.set(f'{ml_text}Подтверждённые группы — сначала; остальные — в конце по типу и размеру · '
                                 f'Без чтения (>128 МиБ): {large} · Ошибок чтения/извлечения: {unavailable}. '
-                                'Заголовки сортируют внутри групп. Основание — под выбранным файлом.')
+                                'Карта показывает темы и выбросы. Основание — под выбранным файлом.')
+                self.refresh_controls()
         self.run('Сравнение содержимого файлов', lambda: self.session.group_similar(self.tick), done)
+
+    def show_similarity_map(self):
+        points = self.similarity_map.get('points', [])
+        if not points:
+            messagebox.showinfo('Карта групп', 'Сначала выполните «По похожести». Карта строится для документов с извлечённым текстом.')
+            return
+        if hasattr(self, 'map_window') and self.map_window.winfo_exists():
+            self.map_window.destroy()
+        top = self.map_window = tk.Toplevel(self.window)
+        top.title('CorpusPick — карта тематических групп')
+        top.geometry('940x680')
+        top.minsize(700, 500)
+        quality = self.similarity_map.get('quality')
+        quality_text = f" · Разделение: {quality:.2f}" if quality is not None else ''
+        summary = (f"Тематических групп: {self.similarity_map.get('clusters', 0)} · "
+                   f"В группах: {self.similarity_map.get('clustered', 0)} / {self.similarity_map.get('eligible', 0)} · "
+                   f"серые точки — выбросы HDBSCAN{quality_text}. "
+                   'Карта — двумерная проекция LSA; наведите или нажмите точку.')
+        ttk.Label(top, text=summary, padding=10, wraplength=900).pack(fill='x')
+        hover = tk.StringVar(value='')
+        ttk.Label(top, textvariable=hover, padding=(10, 4)).pack(fill='x')
+        canvas = tk.Canvas(top, background='#ffffff', highlightthickness=1, highlightbackground='#cccccc')
+        canvas.pack(fill='both', expand=True, padx=10, pady=(0, 10))
+        xs, ys = [p['x'] for p in points], [p['y'] for p in points]
+        x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+        def color(label):
+            if label < 0:
+                return '#a8adb3'
+            red, green, blue = colorsys.hsv_to_rgb((label * .61803398875) % 1, .62, .82)
+            return f'#{int(red*255):02x}{int(green*255):02x}{int(blue*255):02x}'
+        width, height, margin = 900, 570, 24
+        for point in points:
+            x = margin + (point['x'] - x0) / (x1 - x0 or 1) * (width - 2 * margin)
+            y = margin + (point['y'] - y0) / (y1 - y0 or 1) * (height - 2 * margin)
+            item = canvas.create_oval(x-4, y-4, x+4, y+4, fill=color(point['label']), outline='')
+            label = ('выброс' if point['label'] < 0 else f"тема {point['label'] + 1}, уверенность {point['confidence']:.0%}")
+            text = f"{Path(point['path']).name} · {label}"
+            canvas.tag_bind(item, '<Enter>', lambda _, value=text: hover.set(value))
+            canvas.tag_bind(item, '<Leave>', lambda _: hover.set(''))
+            canvas.tag_bind(item, '<Button-1>', lambda _, path=point['path']: self.select_map_point(path))
+
+    def select_map_point(self, path):
+        if self.tree.exists(path):
+            self.tree.selection_set(path)
+            self.tree.focus(path)
+            self.tree.see(path)
+            self.tree.focus_set()
 
     def trim_names(self):
         docs = copy.deepcopy(self.selected_documents())
