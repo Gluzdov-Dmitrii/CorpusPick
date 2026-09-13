@@ -1,9 +1,9 @@
 """Read-only content fingerprints. No extracted text leaves the parser process."""
 from collections import defaultdict
-from functools import lru_cache
 import hashlib
 import heapq
 import logging
+import json
 import os
 from pathlib import Path
 import re
@@ -185,85 +185,114 @@ def overlap(a, b):
     return sum(v in a and v in b for v in sampled) / len(sampled)
 
 
-def evidence(a, b):
+def content_match(a, b):
     if not a or not b or a.get('failed') or b.get('failed'):
         return None
     if a.get('sha256') and a['sha256'] == b.get('sha256'):
-        return 'Точные байты (SHA-256)'
+        return 1.01, 'Точные байты (SHA-256)'
+    matches = []
     if min(a.get('words', 0), b.get('words', 0)) >= 10:
         ratio = min(a['words'], b['words']) / max(a['words'], b['words'])
         score = 1.0 if a['text_sha256'] == b['text_sha256'] else overlap(a.get('text', []), b.get('text', []))
         if score >= .82 and ratio >= .8:
-            return f'Близкий текст: ≈{score:.0%} общих фрагментов; изображения не проверены'
+            matches.append((score, f'Близкий текст: ≈{score:.0%} общих фрагментов; изображения не проверены'))
     if max(a.get('bytes', 0), b.get('bytes', 0)):
         score = overlap(a.get('chunks', []), b.get('chunks', []))
         if a.get('binary_method') == b.get('binary_method'):
             score = max(score, overlap(a.get('binary', []), b.get('binary', [])))
         ratio = min(a['bytes'], b['bytes']) / max(a['bytes'], b['bytes'])
         if score >= .85 and ratio >= .8:
-            return f'Близкие байты: ≈{score:.0%} общих фрагментов'
-    return None
+            matches.append((score, f'Близкие байты: ≈{score:.0%} общих фрагментов'))
+    return max(matches, default=None)
+
+
+def evidence(a, b):
+    match = content_match(a, b)
+    return match[1] if match else None
+
+
+def fingerprint_key(fp):
+    # Only content-derived fields determine processing order / identical units.
+    fields = ('sha256', 'text_sha256', 'words', 'bytes', 'binary_method', 'binary', 'chunks', 'text')
+    return json.dumps({k: fp.get(k) for k in fields}, sort_keys=True, separators=(',', ':'))
 
 
 def content_order(documents, cancel, progress=lambda count: None):
-    from .similarity import similar_order, name_key
-    baseline = similar_order(documents, cancel, with_groups=True)
-    if baseline is None:
-        return None
-    _, name_groups = baseline
-    ordered = sorted(documents, key=lambda d: (name_key(d['path']), d.get('size') or 0, d['path']))
-    postings, by_name, clusters, assigned = defaultdict(list), defaultdict(list), [], {}
-    notes = {}
-    @lru_cache(maxsize=8192)
-    def pair(i, j):
-        a, b = ordered[i].get('content', {}), ordered[j].get('content', {})
-        found = evidence(a, b)
-        if found:
-            return found
-        # Readable conflicting texts override the weak filename fallback.
-        if min(a.get('words', 0), b.get('words', 0)) >= 10:
-            return None
-        if name_groups[ordered[i]['path']] == name_groups[ordered[j]['path']]:
-            return 'Похожее название; содержимое не подтвердило совпадение'
-        return None
-    for i, document in enumerate(ordered):
+    # Collapse identical fingerprints, but never collapse unknown/failed files.
+    buckets, unknown = {}, []
+    for document in documents:
         if cancel.is_set():
             return None
         fp = document.get('content', {})
+        if fp.get('failed') or not fp.get('sha256'):
+            unknown.append(document)
+        else:
+            buckets.setdefault(fingerprint_key(fp), []).append(document)
+    units = [buckets[key] for key in sorted(buckets)]
+    fingerprints = [unit[0]['content'] for unit in units]
+    postings, adjacency, heap = defaultdict(list), {i: {} for i in range(len(units))}, []
+    notes = {}
+    for i, fp in enumerate(fingerprints):
+        if cancel.is_set():
+            return None
         keys = [('b', h) for h in fp.get('binary', [])] + [('t', h) for h in fp.get('text', [])]
         keys += [('c', h) for h in fp.get('chunks', [])]
         keys += [(k, fp[k]) for k in ('sha256', 'text_sha256') if fp.get(k) and (k != 'text_sha256' or fp.get('words', 0) >= 10)]
-        candidates = set(by_name[name_groups[document['path']]][:128])
+        candidates = set()
         for key in keys:
-            candidates.update(postings[key][:256])
-        options = sorted({assigned[j] for j in candidates}, key=lambda g: (not bool(evidence(fp, ordered[clusters[g][0]].get('content', {}))), g))
-        chosen = None
-        for g in options:
-            compatible = True
-            for j in clusters[g]:
-                if cancel.is_set():
-                    return None
-                if not pair(i, j):
-                    compatible = False
-                    break
-            if compatible:
-                chosen = g
-                notes[document['path']] = pair(i, clusters[g][0])
-                notes.setdefault(ordered[clusters[g][0]]['path'], notes[document['path']])
-                break
-        if chosen is None:
-            chosen = len(clusters)
-            clusters.append([])
-        clusters[chosen].append(i)
-        assigned[i] = chosen
-        by_name[name_groups[document['path']]].append(i)
-        for key in keys:
-            if len(postings[key]) < 256:
-                postings[key].append(i)
+            candidates.update(postings[key])
+        for j in sorted(candidates):
+            if cancel.is_set():
+                return None
+            match = content_match(fp, fingerprints[j])
+            if match:
+                score = match[0]
+                adjacency[i][j] = adjacency[j][i] = score
+                heapq.heappush(heap, (-score, j, i, 0, 0))
+        for key in set(keys):
+            postings[key].append(i)
         progress(i + 1)
+    # Agglomerative complete-link: after merging, only common neighbours remain;
+    # their similarity is the minimum across the two former clusters.
+    members = {i: [i] for i in range(len(units))}
+    generations = [0] * len(units)
+    merged = 0
+    while heap:
+        if cancel.is_set():
+            return None
+        negative, a, b, va, vb = heapq.heappop(heap)
+        if a not in members or b not in members or generations[a] != va or generations[b] != vb:
+            continue
+        common = adjacency[a].keys() & adjacency[b].keys()
+        updated = {c: min(adjacency[a][c], adjacency[b][c]) for c in common}
+        for c in adjacency[a].keys() | adjacency[b].keys():
+            adjacency[c].pop(a, None)
+            adjacency[c].pop(b, None)
+        adjacency[a] = {}
+        adjacency.pop(b)
+        members[a].extend(members.pop(b))
+        generations[a] += 1
+        for c, score in updated.items():
+            adjacency[a][c] = adjacency[c][a] = score
+            left, right = sorted((a, c))
+            heapq.heappush(heap, (-score, left, right, generations[left], generations[right]))
+        merged += 1
+        progress(len(units) + merged)
     ranks, groups = {}, {}
-    for group, members in enumerate(clusters):
-        for i in members:
-            path = ordered[i]['path']
-            ranks[path], groups[path] = len(ranks), group
+    for group, indices in enumerate(sorted(members.values(), key=min)):
+        indices = sorted(indices)
+        representative = fingerprints[indices[0]]
+        for i in sorted(indices):
+            note = evidence(fingerprints[i], representative) if len(indices) > 1 or len(units[i]) > 1 else None
+            if i == indices[0] and len(indices) > 1:
+                note = 'Представитель группы: ' + evidence(representative, fingerprints[indices[1]])
+            for document in units[i]:
+                path = document['path']
+                ranks[path], groups[path] = len(ranks), group
+                if note:
+                    notes[path] = note if i == indices[0] else note + ' (с представителем группы)'
+    for offset, document in enumerate(unknown):
+        path = document['path']
+        ranks[path], groups[path] = len(ranks), len(members) + offset
+        notes[path] = 'Содержимое не проанализировано; оставлен отдельно'
     return ranks, groups, notes

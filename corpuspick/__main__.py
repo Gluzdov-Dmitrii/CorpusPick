@@ -365,7 +365,7 @@ class App:
                 self.sort_column, self.sort_reverse = 'similarity', False
                 self.render()
                 unavailable = sum(bool(d.get('content', {}).get('failed') or d.get('content', {}).get('text_failed')) for d in self.view_docs)
-                self.status.set(f'Группировка по содержимому и названиям · Ошибок чтения/извлечения: {unavailable}. '
+                self.status.set(f'Группировка только по содержимому (complete-link) · Ошибок чтения/извлечения: {unavailable}. '
                                 'Заголовки сортируют внутри групп. Основание сравнения — под выбранным файлом.')
         self.run('Сравнение содержимого файлов', lambda: self.session.group_similar(self.tick), done)
 

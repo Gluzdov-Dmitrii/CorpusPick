@@ -11,6 +11,38 @@ from corpuspick.content_similarity import fingerprint, evidence, content_order
 
 
 class ContentTests(unittest.TestCase):
+    def test_names_paths_and_input_order_cannot_change_groups(self):
+        data = random.Random(81).randbytes(4096)
+        fps = [fingerprint(self.put('a.bin', data)),
+               fingerprint(self.put('b.bin', data[:900] + b'xyz' + data[903:])),
+               fingerprint(self.put('c.bin', random.Random(91).randbytes(4096)))]
+        first = [{'path': name, 'content': fp} for name, fp in zip(
+            ('folder/report.doc', 'different/unknown.pdf', 'other/report.doc'), fps)]
+        with patch('corpuspick.similarity.similar_order', side_effect=AssertionError('No filename grouping')):
+            _, groups, _ = content_order(first, threading.Event())
+        self.assertEqual(groups[first[0]['path']], groups[first[1]['path']])
+        self.assertNotEqual(groups[first[0]['path']], groups[first[2]['path']])
+        second = [dict(d, path=f'renamed/{9-i}.anything') for i, d in enumerate(first)]
+        _, renamed, _ = content_order(list(reversed(second)), threading.Event())
+        self.assertEqual([groups[d['path']] for d in first], [renamed[d['path']] for d in second])
+        unknown = [{'path': 'one/report.doc'}, {'path': 'two/report.doc', 'content': {'failed': True}}]
+        _, groups, _ = content_order(unknown, threading.Event())
+        self.assertEqual(len(set(groups.values())), 2)
+
+    def test_complete_link_merges_strongest_pair_before_borderline_file(self):
+        # A-B=.9, A-C=.97, B-C below threshold: filenames/input order must not
+        # let borderline B take A away from the stronger A-C pair.
+        docs = [{'path': name, 'content': {'sha256': key, 'chunks': ['shared']}} for name, key in
+                [('a.doc', 'A'), ('b.doc', 'B'), ('z.doc', 'C')]]
+        def match(a, b):
+            keys = frozenset((a['sha256'], b['sha256']))
+            score = {frozenset(('A', 'B')): .9, frozenset(('A', 'C')): .97}.get(keys)
+            return (score, 'test content match') if score else None
+        with patch('corpuspick.content_similarity.content_match', match):
+            _, groups, _ = content_order(docs, threading.Event())
+            self.assertEqual(groups['a.doc'], groups['z.doc'])
+            self.assertNotEqual(groups['a.doc'], groups['b.doc'])
+
     def test_optimized_chunks_match_previous_cache(self):
         from corpuspick.content_similarity import Sketch, GEAR, binary_fingerprint
         for data in (b'', b'x' * 9000, bytes(range(256)) * 200,
@@ -73,6 +105,16 @@ class ContentTests(unittest.TestCase):
         _, groups, notes = content_order(docs, threading.Event())
         self.assertEqual(len(set(groups.values())), 1)
         self.assertTrue(all('текст' in note for note in notes.values()))
+
+    def test_candidates_beyond_256_are_compared(self):
+        docs = [{'path': str(i), 'content': {'sha256': f'{i:04d}', 'chunks': ['shared']}}
+                for i in range(260)]
+        def match(a, b):
+            return (.95, 'test') if {a['sha256'], b['sha256']} == {'0258', '0259'} else None
+        with patch('corpuspick.content_similarity.content_match', side_effect=match):
+            _, groups, _ = content_order(docs, threading.Event())
+        self.assertEqual(groups['258'], groups['259'])
+        self.assertEqual(len(set(groups.values())), 259)
 
     def test_session_cache_invalidation_and_exact_delete_separation(self):
         data = random.Random(23).randbytes(4096)
