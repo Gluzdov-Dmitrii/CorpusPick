@@ -11,6 +11,23 @@ from corpuspick.content_similarity import fingerprint, evidence, content_order
 
 
 class ContentTests(unittest.TestCase):
+    def test_optimized_chunks_match_previous_cache(self):
+        from corpuspick.content_similarity import Sketch, GEAR, binary_fingerprint
+        for data in (b'', b'x' * 9000, bytes(range(256)) * 200,
+                     random.Random(31).randbytes(1024 * 1024 + 9000)):
+            sketch, chunk, rolling = Sketch(), bytearray(), 0
+            for byte in data:
+                chunk.append(byte)
+                rolling = ((rolling << 1) + GEAR[byte]) & 0xffffffffffffffff
+                if len(chunk) >= 512 and ((rolling & 1023) == 0 or len(chunk) >= 8192):
+                    sketch.add(chunk)
+                    chunk.clear()
+                    rolling = 0
+            if chunk:
+                sketch.add(chunk)
+            actual = binary_fingerprint(self.put('synthetic.bin', data))
+            self.assertEqual(actual['chunks'], sketch.result())
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.base = Path(self.temp.name)

@@ -15,6 +15,8 @@ VERSION = 1
 LIMIT = 256
 GEAR = [int.from_bytes(hashlib.blake2b(bytes([i]), digest_size=8).digest(), 'little') for i in range(256)]
 
+GEAR_LOW = [v & 1023 for v in GEAR]
+
 
 class Sketch:
     def __init__(self):
@@ -35,10 +37,27 @@ class Sketch:
         return [f'{v:016x}' for v in sorted(self.values)]
 
 
+def _chunk_end(data, start, end):
+    if end - start < 512:
+        return end
+    # Only the low ten bits determine a boundary. Earlier bytes vanish after
+    # ten left shifts, so bytes 0..501 need not enter the rolling calculation.
+    gear = GEAR_LOW
+    rolling = 0
+    for byte in data[start + 502:start + 512]:
+        rolling = ((rolling << 1) + gear[byte]) & 1023
+    if rolling == 0:
+        return start + 512
+    for position in range(start + 512, end):
+        rolling = ((rolling << 1) + gear[data[position]]) & 1023
+        if rolling == 0:
+            return position + 1
+    return end
+
+
 def binary_fingerprint(path):
     sha, sketch = hashlib.sha256(), Sketch()
-    chunk, small = bytearray(), bytearray()
-    rolling, size = 0, 0
+    tail, small, size = b'', bytearray(), 0
     with open(path, 'rb') as stream:
         while block := stream.read(1024 * 1024):
             sha.update(block)
@@ -47,15 +66,17 @@ def binary_fingerprint(path):
                 small.extend(block)
             else:
                 small.clear()
-            for byte in block:
-                chunk.append(byte)
-                rolling = ((rolling << 1) + GEAR[byte]) & 0xffffffffffffffff
-                if len(chunk) >= 512 and ((rolling & 1023) == 0 or len(chunk) >= 8192):
-                    sketch.add(chunk)
-                    chunk.clear()
-                    rolling = 0
-    if chunk:
-        sketch.add(chunk)
+            data, start = tail + block, 0
+            while len(data) - start >= 8192:
+                end = _chunk_end(data, start, start + 8192)
+                sketch.add(data[start:end])
+                start = end
+            tail = data[start:]
+    start = 0
+    while start < len(tail):
+        end = _chunk_end(tail, start, min(start + 8192, len(tail)))
+        sketch.add(tail[start:end])
+        start = end
     chunks = sketch.result()
     method = 'chunks'
     if 16 <= size <= 32768:
