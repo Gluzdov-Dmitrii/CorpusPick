@@ -415,3 +415,5 @@ Root code defect identified: edit_shortcut rejected state0x8 as Alt on all platf
 
 ## Layout-independent shortcuts regression (2026-09-17)
 Verified Windows handler prioritizes virtual keycodes65/67/86/88 over layout-dependent keysym. Added168 combinations: Latin/Cyrillic symbolic and Unicode keysyms, uppercase/lowercase/unknown, CapsLock/NumLock/ScrollLock combinations. All168 subtests passed;5tests passed3opt-in GUI tests skipped (GUI behavior previously validated after NumLock fix). No production change needed, no actual user keyboard layout changed. Coverage validates handler inputs, not OS keyboard-layout switching.
+
+2026-09-17: Successful rename/name additions now report in status bar without modal OK. Error details remain visible in a dialog; grouping refresh unchanged.

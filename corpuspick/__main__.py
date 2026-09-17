@@ -1143,7 +1143,10 @@ class App:
                      self.names_changed)
 
     def names_changed(self, result):
-        self.result('Переименование', f"Переименовано: {result['moved']}. Исходные пути сохранены.", result['errors'])
+        summary = f"Переименовано: {result['moved']}. Исходные пути сохранены."
+        self.status.set(summary)
+        if result['errors']:
+            self.result('Ошибки переименования', summary, result['errors'])
         if result['moved'] and self.similarity_groups and not self.session.cancel.is_set():
             threshold = self.similarity_distance()
             self.run('Обновление названий и групп',
