@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "libreoffice": {
+    "version": "26.2.6",
+    "platform": "windows-x86_64",
+    "purpose": "Visual first-page preview of DOC/DOCX/RTF, XLS/XLSX and PPT/PPTX",
+    "required_for_core_app": false,
+    "package": "LibreOffice_26.2.6_Win_x86-64.msi",
+    "urls": [
+      "https://download.documentfoundation.org/libreoffice/stable/26.2.6/win/x86_64/LibreOffice_26.2.6_Win_x86-64.msi",
+      "https://downloadarchive.documentfoundation.org/libreoffice/old/26.2.6.3/win/x86_64/LibreOffice_26.2.6.3_Win_x86-64.msi"
+    ],
+    "sha256": "f9877032fd908beb9c0ddf06df4af5c2e85f419c42e14876c4cce5aae5fb2660",
+    "install_directory": "apps/LibreOffice",
+    "license": "MPL-2.0 and bundled component licenses; retained in extracted runtime"
+  }
+}

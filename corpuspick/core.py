@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import stat
 import tempfile
@@ -56,6 +57,21 @@ def failure(error):
     return f"Ошибка файловой системы (код {code or 'неизвестен'})"
 
 
+def progress_update(progress, count, current=None, force=False):
+    if current is None:
+        progress(count)
+        return
+    if force:
+        try:
+            progress(count, current, True)
+            return
+        except TypeError:
+            pass
+    try:
+        progress(count, current)
+    except TypeError:
+        progress(count)
+
 def move_exclusive(source, destination):
     if os.name == "nt":
         # Windows rename fails on an existing target and preserves ADS/metadata.
@@ -92,6 +108,7 @@ class Session:
             base = Path(os.environ.get("LOCALAPPDATA", Path.home() / ".local/share"))
             data_root = base / "CorpusPick"
         data_root = data_root.resolve()
+        self.data_root = data_root
         if data_root == self.root or data_root.is_relative_to(self.root):
             raise ValueError("Каталог состояния не должен находиться внутри выбранного каталога.")
         key = hashlib.sha256(os.path.normcase(str(self.root)).encode()).hexdigest()
@@ -214,6 +231,11 @@ class Session:
 
     def scan(self, progress=lambda count: None, hash_files=True):
         old = {d['path']: d for d in self.state['documents']}
+        by_identity = {}
+        for document in old.values():
+            identity = document.get('identity')
+            if identity and len(identity) > 1 and identity[1]:
+                by_identity.setdefault(tuple(identity), []).append(document)
         moved = {m['destination']: m for m in self.state['moves'] if m['done']}
         documents = []
         for path, relative in self.walk():
@@ -222,12 +244,18 @@ class Session:
             previous = old.get(relative, {})
             item = {'path': relative, 'origin': relative, 'size': None, 'hash': '',
                     'note': '', 'error': '', 'stats': {}}
+            progress_update(progress, len(documents), relative, force=True)
             try:
                 before = path.stat()
                 identity = [before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns]
                 item.update(size=before.st_size, identity=identity)
+                if not previous:
+                    candidates = by_identity.get(tuple(identity), [])
+                    if len(candidates) == 1 and not Path(native(self.safe_path(candidates[0]['path']))).exists():
+                        previous = candidates[0]
                 if previous.get('identity') == identity:
                     item = dict(previous)
+                    item['path'] = relative
                     item['error'] = ''
                 elif previous:
                     item['origin'] = previous.get('origin', relative)
@@ -252,7 +280,7 @@ class Session:
             except OSError as exc:
                 item['error'] = failure(exc)
             documents.append(item)
-            progress(len(documents))
+            progress_update(progress, len(documents), relative)
         if self.cancel.is_set():
             visited = {d['path'] for d in documents}
             documents.extend(d for d in old.values() if d['path'] not in visited)
@@ -270,6 +298,7 @@ class Session:
             for index, d in enumerate(documents):
                 if self.cancel.is_set():
                     break
+                progress_update(progress, index, d['path'], force=True)
                 try:
                     path = self.safe_path(d['path'])
                     if hashes and not d.get('hash'):
@@ -290,7 +319,7 @@ class Session:
                     d['error'] = failure(exc)
                 except Exception:
                     d['stats'] = {'schema': 2, 'failed': True, 'info': 'Не удалось запустить или выполнить подсчёт'}
-                progress(index + 1)
+                progress_update(progress, index + 1, d['path'])
                 if time.monotonic() - last_save > 5:
                     self.save()
                     last_save = time.monotonic()
@@ -301,7 +330,7 @@ class Session:
         if not self.read_only and os.name == 'nt':
             self.state['unlock_result'] = self.unlock(progress)
         self.scan(progress, hash_files=False)
-        progress(0)
+        progress_update(progress, 0)
 
     def export_structure(self, destination=None, progress=lambda count: None, prepared=False):
         from .manifest import write_manifest
@@ -352,62 +381,75 @@ class Session:
 
     def clear_similarity_cache(self):
         for document in self.state['documents']:
-            document.pop('content', None)
+            document.pop('similarity', None)
         self.save()
 
-    def group_similar(self, progress=lambda count: None):
-        from .content_similarity import (VERSION, TOPIC_VERSION, TOPIC_SUFFIXES, content_worker,
-                                         content_order, size_only, topic_worker)
+    def group_similar(self, progress=lambda count: None, distance_threshold=.35, rescan=True):
+        from .error_logging import log_message
+        log_message('Similarity started')
+        from .content_similarity import metadata_order, TEXT_SUFFIXES
+        from .embeddings import EMBEDDING_VERSION, embedding_worker, ensure_model, metadata_key, reusable_similarity
+        from .ocr import ensure_ocr_model
         from .stats_worker import StatsWorker
-        self.scan(progress, hash_files=False)
+        if rescan:
+            self.scan(progress, hash_files=False)
         last_save = time.monotonic()
-        with StatsWorker(timeout=90, target=content_worker, retry_label='По похожести') as worker:
+        pending_embeddings = []
+        for document in self.state['documents']:
+            metadata_paths = {document['path'], document.get('origin', document['path'])}
+            metadata_paths.update(document.get('origins', []))
+            key = metadata_key(metadata_paths)
+            signature = document.get('similarity', {})
+            if signature.get('embedding_version') != EMBEDDING_VERSION or signature.get('metadata_key') != key:
+                pending_embeddings.append(document)
+        model_dir = ensure_model(self.data_root, self.cancel) if pending_embeddings else None
+        log_message('Similarity extraction', documents=len(self.state['documents']), pending=len(pending_embeddings))
+        needs_ocr = any(Path(document['path']).suffix.lower() == '.pdf' and
+                        not reusable_similarity(document.get('similarity', {})) for document in pending_embeddings)
+        ocr_model = ensure_ocr_model(self.data_root, self.cancel) if needs_ocr else None
+        # Only bounded views are read: three PDF pages or three text excerpts.
+        # OCR text stays inside the worker; only embeddings/layout/entity counts return.
+        with StatsWorker(timeout=180, target=embedding_worker, retry_label='По похожести',
+                         init_args=(str(model_dir), str(ocr_model) if ocr_model else None)) as worker:
             for index, document in enumerate(self.state['documents']):
                 if self.cancel.is_set():
                     break
-                signature = document.get('content', {})
+                metadata_paths = {document['path'], document.get('origin', document['path'])}
+                metadata_paths.update(document.get('origins', []))
+                key = metadata_key(metadata_paths)
+                signature = document.get('similarity', {})
+                if signature.get('embedding_version') == EMBEDDING_VERSION and signature.get('metadata_key') == key:
+                    continue
+                progress_update(progress, index, document['path'], force=True)
                 try:
-                    path = self.checked_document(document)
-                    if not size_only(document) and signature.get('version') != VERSION:
-                        signature = worker.count(path, self.cancel)
+                    suffix = Path(document['path']).suffix.lower()
+                    path = self.checked_document(document) if suffix in TEXT_SUFFIXES else None
+                    request = {'path': str(path) if path else None,
+                               'metadata_paths': sorted(metadata_paths)}
+                    if reusable_similarity(signature):
+                        request['cached_similarity'] = signature
+                        request['path'] = None
+                    updated = worker.count(path or document['path'], self.cancel, request=request)
+                    if path:
                         self.checked_document(document)
-                        document['content'] = signature
-                        if signature.get('sha256'):
-                            document['hash'] = signature['sha256']
+                    if request.get('cached_similarity') and (updated.get('failed') or updated.get('embedding_failed')):
+                        # Retain expensive content if only metadata refresh failed.
+                        document['similarity'] = dict(signature, metadata_refresh_failed=True)
+                        progress_update(progress, index + 1, document['path'])
+                        continue
+                    signature = updated
+                    signature.pop('metadata_refresh_failed', None)
+                    signature.setdefault('metadata_key', key)
+                    if signature.pop('failed', False):
+                        signature['embedding_failed'] = True
+                    document['similarity'] = signature
                 except Cancelled:
                     break
                 except (OSError, ValueError):
-                    document.update(content={'version': VERSION, 'failed': True,
-                                             'info': 'Файл недоступен или изменился во время анализа; повтор — после сброса кэша'}, hash='')
-                progress(index + 1)
-                if time.monotonic() - last_save > 5:
-                    self.save()
-                    last_save = time.monotonic()
-        # Existing byte/text fingerprints remain valid. Add the bounded thematic
-        # vector without rereading all bytes or every page.
-        with StatsWorker(timeout=45, target=topic_worker, retry_label='По похожести') as worker:
-            for index, document in enumerate(self.state['documents']):
-                if self.cancel.is_set():
-                    break
-                signature = document.get('content', {})
-                if size_only(document) or signature.get('failed'):
-                    continue
-                if Path(document['path']).suffix.lower() not in TOPIC_SUFFIXES:
-                    signature.update(topic_version=TOPIC_VERSION, topic_words=0, topic='')
-                    continue
-                if signature.get('topic_version') == TOPIC_VERSION:
-                    continue
-                try:
-                    path = self.checked_document(document)
-                    topic = worker.count(path, self.cancel)
-                    self.checked_document(document)
-                    signature.update(topic)
-                except Cancelled:
-                    break
-                except (OSError, ValueError):
-                    signature.update(topic_version=TOPIC_VERSION, topic_failed=True,
-                                     info='Тематические признаки недоступны: файл изменился')
-                progress(index + 1)
+                    document['similarity'] = {
+                        'embedding_version': EMBEDDING_VERSION, 'metadata_key': key,
+                        'embedding_failed': True, 'info': 'Metadata-эмбеддинг недоступен'}
+                progress_update(progress, index + 1, document['path'])
                 if time.monotonic() - last_save > 5:
                     self.save()
                     last_save = time.monotonic()
@@ -415,7 +457,15 @@ class Session:
         self.save()
         if self.cancel.is_set():
             return None
-        return content_order(self.state['documents'], self.cancel, progress)
+        log_message('Similarity clustering', documents=len(self.state['documents']))
+        result = metadata_order(self.state['documents'], self.cancel, progress, distance_threshold)
+        log_message('Similarity finished', cancelled=self.cancel.is_set())
+        return result
+
+    def regroup_similar(self, distance_threshold=.35, progress=lambda count: None):
+        """Rebuild groups from cached vectors without rescanning or reading documents."""
+        from .content_similarity import metadata_order
+        return metadata_order(self.state['documents'], self.cancel, progress, distance_threshold)
 
     def duplicate_plan(self, progress=lambda count: None):
         self.scan(progress)
@@ -442,7 +492,7 @@ class Session:
     def trash_documents(self, documents=None, duplicate_plan=None, progress=lambda count: None):
         self.require_write()
         if any(not m['done'] for m in self.state['moves']):
-            raise ValueError('Сначала завершите перенос или нажмите «Сбросить план»')
+            raise ValueError('Сначала завершите перенос')
         result = {'trashed': 0, 'errors': []}
         removed_paths = set()
         entries = duplicate_plan if duplicate_plan is not None else [{'remove': d} for d in documents or []]
@@ -450,6 +500,7 @@ class Session:
             if self.cancel.is_set():
                 break
             document = entry['remove']
+            progress_update(progress, index, document['path'], force=True)
             try:
                 if 'keep' in entry:
                     if entry['keep']['path'] == document['path'] or entry['keep'].get('hash') != document.get('hash'):
@@ -464,31 +515,45 @@ class Session:
             except (OSError, ValueError) as exc:
                 result['errors'].append({'path': document['path'],
                                         'error': str(exc) if isinstance(exc, ValueError) else failure(exc)})
-            progress(index + 1)
+            progress_update(progress, index + 1, document['path'])
         self.state['documents'] = [d for d in self.state['documents'] if d['path'] not in removed_paths]
         self.scan(progress)
         return result
 
     def trim_prefix(self, documents, count, progress=lambda count: None):
-        self.require_write()
-        if any(not m['done'] for m in self.state['moves']):
-            raise ValueError('Сначала завершите перенос или нажмите «Сбросить план»')
         if type(count) is not int or count < 1:
             raise ValueError('Введите целое число символов больше нуля')
+        def name(source):
+            if len(source.stem) <= count:
+                raise ValueError('После удаления префикса имя станет пустым')
+            return source.stem[count:] + source.suffix
+        return self._rename_documents(documents, name, progress)
+
+    def add_prefix(self, documents, prefix, progress=lambda count: None):
+        self.require_write()
+        if not isinstance(prefix, str) or not prefix.strip() or any(
+                char in '<>:"/\\|?*' or ord(char) < 32 for char in prefix):
+            raise ValueError('Введите непустой префикс без запрещённых символов имени файла')
+        return self._rename_documents(documents, lambda source: prefix + source.name, progress)
+
+    def _rename_documents(self, documents, make_name, progress):
+        self.require_write()
+        if any(not m['done'] for m in self.state['moves']):
+            raise ValueError('Сначала завершите перенос')
         pending, errors = [], []
         reserved = set()
         for document in documents:
             try:
                 source = self.checked_document(document)
-                if len(source.stem) <= count:
-                    raise ValueError('После удаления префикса имя станет пустым')
-                name = source.stem[count:] + source.suffix
+                name = make_name(source)
                 stem = Path(name).stem
-                if name.startswith('.') or name.endswith((' ', '.')) or stem.upper().split('.')[0] in {
+                if len(name.encode('utf-16-le')) > 510 or name.startswith('.') or name.endswith((' ', '.')) or stem.upper().split('.')[0] in {
                     'CON', 'PRN', 'AUX', 'NUL', *('COM' + str(i) for i in range(1, 10)),
                     *('LPT' + str(i) for i in range(1, 10))}:
                     raise ValueError('Недопустимое новое имя Windows')
                 destination = source.with_name(name)
+                if destination == source:
+                    continue
                 if Path(native(destination)).exists() or str(destination).casefold() in reserved:
                     raise ValueError('Такое имя уже существует; файл пропущен')
                 reserved.add(str(destination).casefold())
@@ -504,6 +569,81 @@ class Session:
         result = self.flatten(progress)
         result['errors'] = errors + result['errors']
         return result
+
+    def rename_documents(self, documents, base_name, progress=lambda count: None):
+        self.require_write()
+        if (not isinstance(base_name, str) or not base_name.strip() or
+                base_name.startswith('.') or base_name.endswith((' ', '.')) or
+                any(c in '<>:"/\\|?*' or ord(c) < 32 for c in base_name)):
+            raise ValueError('Введите допустимое название без расширения и запрещённых символов')
+        if not documents:
+            return {'moved': 0, 'errors': []}
+        pattern = re.compile(re.escape(base_name) + r' [#№]([0-9]+)', re.IGNORECASE)
+        occupied = Counter()
+        selected_numbers = {}
+        existing_series = []
+        previous_width = 2
+        has_series = False
+        existing_plain = False
+        selected_paths = {document['path'] for document in documents}
+        # Read current filesystem names, not a possibly stale catalogue. Number
+        # one series across extensions and subfolders of the opened root.
+        for path, relative in self.walk():
+            match = pattern.fullmatch(path.stem)
+            if match:
+                has_series = True
+                number = int(match.group(1))
+                previous_width = max(previous_width, len(match.group(1)))
+                if relative not in selected_paths:
+                    existing_series.append((relative, number, path.stat()))
+                if relative not in selected_paths or ' #' in path.stem:
+                    occupied[number] += 1
+                    if relative in selected_paths:
+                        selected_numbers[relative] = number
+            if path.stem.casefold() == base_name.casefold() and relative not in selected_paths:
+                existing_plain = True
+        if self.cancel.is_set():
+            return {'moved': 0, 'errors': [], 'stopped': True}
+        numbers = {}
+        next_number = 1
+        for document in documents:
+            relative = document['path']
+            if relative in selected_numbers:
+                released = selected_numbers[relative]
+                occupied[released] -= 1
+                next_number = min(next_number, released)
+            while occupied[next_number]:
+                next_number += 1
+            numbers[relative] = next_number
+            occupied[next_number] += 1
+        multiple = len(documents) > 1 or has_series or existing_plain
+        width = max(previous_width, len(str(max([*numbers.values(), *(n for _, n, _ in existing_series)], default=1))))
+        # Widen the entire series when it crosses 99/999/etc., including files
+        # outside the selection. All changes use the same durable rename journal.
+        rename_documents = list(documents)
+        known = {d['path']: d for d in self.state['documents']}
+        for relative, number, info in existing_series:
+            source = Path(relative)
+            target_name = base_name + f' #{number:0{width}d}' + source.suffix
+            if source.name == target_name:
+                continue
+            document = known.get(relative)
+            if document is None:
+                document = {'path': relative, 'origin': relative, 'size': info.st_size,
+                            'identity': [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns],
+                            'hash': '', 'stats': {}, 'error': '', 'note': ''}
+                self.state['documents'].append(document)
+            rename_documents.append(document)
+            numbers[relative] = number
+        def name(source):
+            number = numbers[str(source.relative_to(self.root))]
+            return base_name + (f' #{number:0{width}d}' if multiple else '') + source.suffix
+        return self._rename_documents(rename_documents, name, progress)
+
+    def add_name_parts(self, documents, text='', directory_count=0, at_end=False, progress=lambda count: None):
+        from .name_dialog import composed_name
+        return self._rename_documents(documents,
+            lambda source: composed_name(self.root, source, text, directory_count, at_end), progress)
 
     def flatten(self, progress=lambda count: None):
         self.require_write()
@@ -541,6 +681,7 @@ class Session:
         for index, move in enumerate(pending):
             if self.cancel.is_set():
                 break
+            progress_update(progress, index, move["source"], force=True)
             try:
                 source = self.safe_path(move["source"])
                 destination = self.safe_path(move["destination"])
@@ -549,7 +690,7 @@ class Session:
                     if move.get("method") != "rename":
                         # Recover journals made by the first hard-link version.
                         if digest(src) != move["hash"]:
-                            raise ValueError("Файл изменён; нажмите «Сбросить план»")
+                            raise ValueError("Файл изменён; обновите список и повторите операцию")
                         if dst.exists():
                             if not os.path.samefile(src, dst):
                                 raise FileExistsError()
@@ -560,7 +701,7 @@ class Session:
                         before = src.stat()
                         identity = [before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns]
                         if move.get("identity") and identity != move["identity"]:
-                            raise ValueError("Файл изменён; нажмите «Сбросить план»")
+                            raise ValueError("Файл изменён; обновите список и повторите операцию")
                         move_exclusive(src, dst)
                 elif dst.is_file():
                     info = dst.stat()
@@ -582,7 +723,7 @@ class Session:
                 result["errors"].append({"path": move["source"], "error": move["error"]})
             if move["done"]:
                 self.log_move(move)
-            progress(index + 1)
+            progress_update(progress, index + 1, move["source"])
         self.save()
         self.journal_path.unlink(missing_ok=True)
         self.export_structure(prepared=True)
@@ -638,6 +779,7 @@ class Session:
             raise ValueError("Unlock доступен только в Windows")
         result = {"unlocked": 0, "unchanged": 0, "errors": []}
         for index, (path, relative) in enumerate(self.walk()):
+            progress_update(progress, index, relative, force=True)
             try:
                 os.unlink(str(path) + ":Zone.Identifier")
                 result["unlocked"] += 1
@@ -645,25 +787,84 @@ class Session:
                 result["unchanged"] += 1
             except OSError as exc:
                 result["errors"].append({"path": relative, "error": failure(exc)})
-            progress(index + 1)
+            progress_update(progress, index + 1, relative)
         result["errors"].extend({"path": "Каталог", "error": e} for e in self.state["issues"])
         return result
 
-    def collect_stats(self, progress=lambda count: None, use_word=False, selected=None):
-        from .statistics import word_stats
-        if use_word and self.read_only:
-            raise ValueError('В режиме бэкапа доступен только быстрый подсчёт без запуска Word')
+    def collect_stats(self, progress=lambda count: None, use_libreoffice=False, selected=None):
         self.scan(progress, hash_files=False)
-        if not use_word:
+        if not use_libreoffice:
             return self.analyze(progress, selected=selected, hashes=False)
-        for index, d in enumerate(self.state['documents']):
-            if self.cancel.is_set():
-                break
-            if selected is not None and d['path'] not in selected:
-                continue
-            if Path(d['path']).suffix.lower() not in ('.doc', '.docx'):
-                continue
-            d['stats'] = word_stats(self.safe_path(d['path']))
-            d['stats']['schema'] = 2
-            progress(index + 1)
+        from .office_profile import OFFICE_STATS_TIMEOUT
+        from .stats_worker import StatsWorker, libreoffice_stats_worker
+        documents = [d for d in self.state['documents'] if selected is None or d['path'] in selected]
+        summary = {'updated': 0, 'errors': 0, 'skipped': 0}
+        last_save = time.monotonic()
+        with StatsWorker(timeout=OFFICE_STATS_TIMEOUT, target=libreoffice_stats_worker,
+                         retry_label='Статистика') as worker:
+            for index, d in enumerate(documents):
+                if self.cancel.is_set():
+                    break
+                path = Path(d['path'])
+                suffix = path.suffix.lower()
+                progress_update(progress, index, d['path'], force=True)
+                if suffix not in ('.doc', '.docx', '.rtf') or path.name.startswith('~$'):
+                    summary['skipped'] += 1
+                    progress_update(progress, index + 1, d['path'])
+                    continue
+                try:
+                    source = self.safe_path(d['path'])
+                    before = source.stat()
+                    identity = [before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns]
+                    if d.get('identity') != identity:
+                        d.update(hash='', stats={}, error='Файл изменился: обновите список')
+                        summary['errors'] += 1
+                    else:
+                        result = worker.count(source, self.cancel, request={'path': str(source)})
+                        after = source.stat()
+                        current = [after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns]
+                        if current != identity:
+                            d.update(hash='', stats={}, error='Файл изменился: обновите список')
+                            summary['errors'] += 1
+                        elif result.get('failed'):
+                            had_previous = bool(d.get('stats'))
+                            previous = dict(d.get('stats') or {})
+                            if had_previous:
+                                previous.update(schema=2, libreoffice_failed=True,
+                                                info='Уточнение LibreOffice не выполнено; показаны прежние значения.')
+                            else:
+                                previous = {'schema': 2, 'failed': True, 'libreoffice_failed': True,
+                                            'info': result.get('info', 'LibreOffice не смог прочитать документ.')}
+                            d['stats'] = previous
+                            summary['errors'] += 1
+                        else:
+                            previous = d.get('stats') or {}
+                            stats = {'schema': 2, 'info': result.get('info', 'Точная статистика LibreOffice.')}
+                            for field in ('pages', 'figures', 'tables'):
+                                value = result.get(field)
+                                if type(value) is int and value >= 0:
+                                    stats[field] = value
+                                elif previous.get(field) is not None:
+                                    stats[field] = previous[field]
+                                    if previous.get(field + '_estimated'):
+                                        stats[field + '_estimated'] = True
+                            d['stats'] = stats
+                            d['error'] = ''
+                            summary['updated'] += 1
+                except Cancelled:
+                    break
+                except OSError as exc:
+                    d['error'] = failure(exc)
+                    summary['errors'] += 1
+                except Exception:
+                    d['stats'] = {'schema': 2, 'failed': True, 'libreoffice_failed': True,
+                                  'info': 'Не удалось выполнить точный подсчёт через LibreOffice.'}
+                    summary['errors'] += 1
+                progress_update(progress, index + 1, d['path'])
+                if time.monotonic() - last_save > 5:
+                    self.save()
+                    last_save = time.monotonic()
+        summary['stopped'] = self.cancel.is_set()
+        self.regroup()
         self.save()
+        return summary

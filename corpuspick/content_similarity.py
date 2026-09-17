@@ -1,5 +1,5 @@
 """Read-only content fingerprints. No extracted text leaves the parser process."""
-from collections import defaultdict
+from collections import Counter, defaultdict
 import base64
 import hashlib
 import heapq
@@ -14,13 +14,17 @@ import zlib
 from zipfile import ZipFile
 
 VERSION = 1
-TOPIC_VERSION = 2
 LIMIT = 256
-TOPIC_DIMENSIONS = 8192
-TOPIC_WORD_LIMIT = 3000
 MAX_CONTENT_BYTES = 128 * 1024 * 1024
-TOPIC_SUFFIXES = ('.docx', '.pdf', '.txt', '.md', '.csv', '.tsv')
+TEXT_SUFFIXES = ('.docx', '.pdf', '.txt', '.md', '.csv', '.tsv')
 VISUAL_VERSION = 1
+LABEL_MIN_DOCUMENTS = 5
+LABEL_MAX_FRACTION = .8
+LABEL_STOPWORDS = {
+    'без', 'для', 'документ', 'документы', 'копия', 'новый', 'новая', 'новое', 'от', 'по', 'проект',
+    'редакция', 'скан', 'файл', 'файлы', 'and', 'copy', 'document', 'documents', 'file', 'final', 'new',
+    'the', 'version',
+}
 
 
 def size_only(document):
@@ -100,47 +104,15 @@ def binary_fingerprint(path):
     return {'sha256': sha.hexdigest(), 'bytes': size, 'binary': sketch.result(), 'binary_method': method, 'chunks': chunks}
 
 
-def _topic_add(counts, feature):
-    digest = hashlib.blake2b(feature, digest_size=4, person=b'CorpusT').digest()
-    index = int.from_bytes(digest, 'little') % TOPIC_DIMENSIONS
-    if counts[index] < 65535:
-        counts[index] += 1
-
-
-def _packed_topic(counts):
-    import array
-    packed = array.array('H', counts)
-    if sys.byteorder != 'little':
-        packed.byteswap()
-    return base64.b64encode(zlib.compress(packed.tobytes(), level=6)).decode('ascii')
-
-
-def _topic_result(counts, words):
-    return {'topic_version': TOPIC_VERSION, 'topic_words': words, 'topic': _packed_topic(counts)}
-
-
-def text_fingerprint(parts, topic_only=False):
+def text_fingerprint(parts):
     sketch, sha = Sketch(), hashlib.sha256()
-    window, count, topic_words, previous = [], 0, 0, None
-    counts = [0] * TOPIC_DIMENSIONS
+    window, count = [], 0
     iterator = iter(parts)
     try:
         for part in iterator:
             normalized = unicodedata.normalize('NFKC', part).casefold().replace('ё', 'е')
             for word in re.findall(r'[^\W_]+', normalized):
                 encoded = word.encode('utf-8')
-                if topic_words < TOPIC_WORD_LIMIT:
-                    _topic_add(counts, b'u\0' + encoded)
-                    if previous is not None:
-                        _topic_add(counts, b'b\0' + previous + b'\0' + encoded)
-                    if len(word) >= 4:
-                        _topic_add(counts, b'p\0' + word[:3].encode('utf-8'))
-                    previous = encoded
-                    topic_words += 1
-                if topic_only:
-                    if topic_words >= TOPIC_WORD_LIMIT:
-                        return _topic_result(counts, topic_words)
-                    continue
                 sha.update(encoded + b'\0')
                 count += 1
                 window.append(encoded)
@@ -152,11 +124,7 @@ def text_fingerprint(parts, topic_only=False):
         close = getattr(iterator, 'close', None)
         if close:
             close()
-    topic = _topic_result(counts, topic_words)
-    if topic_only:
-        return topic
-    topic.update(text=sketch.result(), text_sha256=sha.hexdigest(), words=count)
-    return topic
+    return {'text': sketch.result(), 'text_sha256': sha.hexdigest(), 'words': count}
 
 
 def text_parts(path, max_pages=None):
@@ -195,14 +163,14 @@ def text_parts(path, max_pages=None):
             raise
 
 
-def extracted_fingerprint(path, topic_only=False):
+def extracted_fingerprint(path):
     try:
-        return text_fingerprint(text_parts(path, max_pages=12 if topic_only else None), topic_only=topic_only)
+        return text_fingerprint(text_parts(path))
     except UnicodeError:
         if path.suffix.lower() not in ('.txt', '.md', '.csv', '.tsv'):
             raise
         with open(path, encoding='cp1251') as stream:
-            return text_fingerprint(stream, topic_only=topic_only)
+            return text_fingerprint(stream)
 
 
 def _perceptual_hash(image):
@@ -263,7 +231,7 @@ def fingerprint(path):
     path = Path(native(Path(path)))
     result = binary_fingerprint(path)
     result.update(version=VERSION, info='Байты прочитаны полностью; текст для этого формата не извлекается')
-    if path.suffix.lower() in TOPIC_SUFFIXES:
+    if path.suffix.lower() in TEXT_SUFFIXES:
         try:
             text = extracted_fingerprint(path)
             result.update(text)
@@ -280,39 +248,6 @@ def fingerprint(path):
                 except Exception:
                     result['visual_failed'] = True
     return result
-
-
-def topic_worker(connection):
-    """Extract only a bounded, hashed topic vector; no source text crosses IPC."""
-    from .core import native
-    with open(os.devnull, 'w') as quiet:
-        sys.stdout = sys.stderr = quiet
-        try:
-            while True:
-                path = connection.recv()
-                try:
-                    source = Path(native(Path(path)))
-                    if source.suffix.lower() not in TOPIC_SUFFIXES:
-                        result = {'topic_version': TOPIC_VERSION, 'topic_words': 0, 'topic': ''}
-                    else:
-                        try:
-                            result = extracted_fingerprint(source, topic_only=True)
-                        except Exception:
-                            result = {'topic_version': TOPIC_VERSION, 'topic_words': 0, 'topic': '',
-                                      'topic_failed': True}
-                        if source.suffix.lower() == '.pdf' and result.get('topic_words', 0) < 20:
-                            try:
-                                result.update(pdf_visual_fingerprint(source))
-                            except Exception:
-                                result['visual_failed'] = True
-                except Exception:
-                    result = {'topic_version': TOPIC_VERSION, 'topic_failed': True,
-                              'info': 'Тематические признаки извлечь не удалось'}
-                connection.send(result)
-        except (EOFError, BrokenPipeError):
-            pass
-        finally:
-            connection.close()
 
 
 def content_worker(connection):
@@ -410,58 +345,363 @@ def fingerprint_key(fp):
     return json.dumps({k: fp.get(k) for k in fields}, sort_keys=True, separators=(',', ':'))
 
 
+def _label_tokens(value):
+    """Return local weak-label tokens without exposing names outside this process."""
+    normalized = unicodedata.normalize('NFKC', value).casefold().replace('ё', 'е')
+    tokens = re.findall(r'[^\W_]+(?:-[^\W_]+)+|[^\W_]+', normalized)
+    result, sequence = set(), []
+    for token in tokens:
+        token = token.replace('-', '_')
+        if (token in LABEL_STOPWORDS or token.isdigit() or len(token) < 2
+                or re.fullmatch(r'(?:v|ver|версия)?\d+[a-zа-я]?', token)):
+            sequence.append(None)
+            continue
+        if any(character.isalpha() for character in token):
+            result.add(token)
+            sequence.append(token)
+        else:
+            sequence.append(None)
+    for left, right in zip(sequence, sequence[1:]):
+        if left and right:
+            result.add(left + '_' + right)
+    return result
+
+
+def weak_label_candidates(documents, minimum=LABEL_MIN_DOCUMENTS):
+    """Mine repeated name/path terms and return overlap-safe candidate labels.
+
+    Near-identical postings (for example ``акт приема передачи``) are aliases,
+    not competing classes.  Independent overlaps remain ambiguous and therefore
+    are not used as SVM training examples.
+    """
+    sources, postings = {}, defaultdict(set)
+    for index, document in enumerate(documents):
+        paths = {document['path'], document.get('origin', document['path'])}
+        paths.update(document.get('origins', []))
+        name_terms, folder_terms = set(), set()
+        for value in paths:
+            path = Path(value)
+            name_terms.update(_label_tokens(path.stem))
+            for part in path.parts[:-1]:
+                folder_terms.update(_label_tokens(part))
+        sources[index] = (name_terms, folder_terms)
+        for term in name_terms | folder_terms:
+            postings[term].add(index)
+    limit = max(minimum, int(len(documents) * LABEL_MAX_FRACTION) + 1)
+    terms = sorted(term for term, indices in postings.items() if minimum <= len(indices) < limit)
+    parents = {term: term for term in terms}
+
+    def find(term):
+        while parents[term] != term:
+            parents[term] = parents[parents[term]]
+            term = parents[term]
+        return term
+
+    def union(left, right):
+        left, right = find(left), find(right)
+        if left != right:
+            parents[right] = left
+
+    for offset, left in enumerate(terms):
+        for right in terms[offset + 1:]:
+            overlap = len(postings[left] & postings[right])
+            smaller, larger = sorted((len(postings[left]), len(postings[right])))
+            if overlap / smaller >= .85 and larger / smaller <= 1.25:
+                union(left, right)
+    aliases = defaultdict(list)
+    for term in terms:
+        aliases[find(term)].append(term)
+    canonical = {}
+    for group in aliases.values():
+        # Preserve a repeated phrase as one class instead of letting its
+        # individual words create competing classes.
+        representative = min(group, key=lambda term: ('_' not in term, len(term), term))
+        canonical.update((term, representative) for term in group)
+    result = {}
+    for index, document in enumerate(documents):
+        name_terms, folder_terms = sources[index]
+        name_labels = {canonical[term] for term in name_terms if term in canonical}
+        folder_labels = {canonical[term] for term in folder_terms if term in canonical}
+        # A unique filename label is stronger than unrelated broad directory labels.
+        labels = name_labels if len(name_labels) == 1 else name_labels | folder_labels
+        result[document['path']] = sorted(labels)
+    return result, {label: len(set().union(*(postings[t] for t, value in canonical.items() if value == label)))
+                    for label in set(canonical.values())}
+
+
+def _semantic_embedding(documents):
+    import numpy as np
+    from .embeddings import unpack_embedding
+
+    vectors = {}
+    for document in documents:
+        signature = document['content']
+        vectors.setdefault(signature['embedding'], []).append(document)
+    keys = sorted(vectors)
+    return keys, vectors, np.stack([unpack_embedding(encoded) for encoded in keys])
+
+
 def semantic_layout(documents, cancel):
-    """Cluster bounded hashed text features with TF-IDF, LSA and HDBSCAN."""
+    """Weak supervision from names/paths plus open-set Linear SVM over E5.
+
+    Unlabelled dense content communities become ``other_N`` seed classes.  The
+    SVM may extend a class, but low-margin or centroid-distant documents remain
+    unassigned instead of being forced into the closest class.
+    """
+    from .embeddings import EMBEDDING_VERSION
     candidates = [document for document in documents
                   if not size_only(document)
-                  and document.get('content', {}).get('topic_version') == TOPIC_VERSION
-                  and document.get('content', {}).get('topic_words', 0) >= 20
-                  and document.get('content', {}).get('topic')]
+                  and document.get('content', {}).get('embedding_version') == EMBEDDING_VERSION
+                  and document.get('content', {}).get('embedding')]
     if len(candidates) < 5 or cancel.is_set():
         return {}, {'clusters': 0, 'clustered': 0, 'eligible': len(candidates)}
     try:
-        import numpy as np
         from sklearn.cluster import HDBSCAN
-        from sklearn.decomposition import TruncatedSVD
-        from sklearn.feature_extraction.text import TfidfTransformer
-        from sklearn.preprocessing import normalize
+        import numpy as np
+        from sklearn.svm import LinearSVC
 
-        # Exact topic vectors must not distort density merely because copies exist.
-        vectors = {}
-        for document in candidates:
-            signature = document['content']
-            vectors.setdefault((signature['topic'], signature['topic_words']), []).append(document)
-        keys = sorted(vectors)
-        rows = []
-        for encoded, _ in keys:
-            raw = zlib.decompress(base64.b64decode(encoded))
-            row = np.frombuffer(raw, dtype='<u2')
-            if len(row) != TOPIC_DIMENSIONS:
-                raise ValueError('Invalid topic vector')
-            rows.append(row)
-        if len(rows) < 5:
-            return {}, {'clusters': 0, 'clustered': 0, 'eligible': len(candidates)}
-        matrix = np.stack(rows)
-        tfidf = TfidfTransformer(sublinear_tf=True).fit_transform(matrix)
-        dimensions = min(64, len(rows) - 1, TOPIC_DIMENSIONS - 1)
-        embedding = TruncatedSVD(n_components=dimensions, random_state=0).fit_transform(tfidf)
-        embedding = normalize(embedding)
-        model = HDBSCAN(min_cluster_size=5, min_samples=2, copy=True,
-                        cluster_selection_method='eom', allow_single_cluster=False).fit(embedding)
-        labels, probabilities = model.labels_, model.probabilities_
-        result = {}
+        keys, vectors, embedding = _semantic_embedding(candidates)
+        weak, frequencies = weak_label_candidates(documents)
+        training, training_support = {}, {}
+        ambiguous = sum(len(labels) > 1 for labels in weak.values())
         for index, key in enumerate(keys):
-            label, probability = int(labels[index]), float(probabilities[index])
+            labels = set()
             for document in vectors[key]:
-                path = document['path']
-                result[path] = (label, probability)
-        cluster_labels = {label for label in labels if label >= 0}
-        return result, {'clusters': len(cluster_labels),
-                        'clustered': sum(label >= 0 for label, _ in result.values()),
-                        'eligible': len(candidates)}
+                document_labels = weak.get(document['path'], [])
+                if len(document_labels) == 1:
+                    labels.add(document_labels[0])
+            if len(labels) == 1:
+                training[index] = 'label:' + labels.pop()
+                training_support[index] = sum(weak.get(document['path']) == [training[index][6:]]
+                                              for document in vectors[key])
+
+        # Discover content-only classes among documents that supplied no reliable
+        # filename/path seed.  They are deliberately named other_N.
+        unlabelled = [index for index, key in enumerate(keys)
+                      if index not in training and not any(weak.get(document['path']) for document in vectors[key])]
+        if len(unlabelled) >= 5:
+            cluster = HDBSCAN(min_cluster_size=5, min_samples=2, copy=True,
+                              cluster_selection_method='eom', allow_single_cluster=True).fit(embedding[unlabelled])
+            other_labels = sorted(set(int(label) for label in cluster.labels_ if label >= 0))
+            other_names = {label: f'other_{number + 1}' for number, label in enumerate(other_labels)}
+            for position, label in zip(unlabelled, cluster.labels_):
+                if int(label) >= 0:
+                    training[position] = other_names[int(label)]
+                    training_support[position] = len(vectors[keys[position]])
+
+        class_counts = Counter()
+        for index, label in training.items():
+            class_counts[label] += training_support.get(index, 1)
+        usable = {label for label, count in class_counts.items() if count >= 2}
+        training = {index: label for index, label in training.items() if label in usable}
+        available_classes = sorted(set(training.values()))
+        if not available_classes:
+            return {}, {'clusters': 0, 'clustered': 0, 'eligible': len(candidates),
+                        'labels': len(frequencies), 'ambiguous': ambiguous,
+                        'error': 'Недостаточно независимых слабых классов для SVM'}
+        if len(available_classes) == 1:
+            label = available_classes[0]
+            shown = label.removeprefix('label:')
+            source = ('метка из имени/пути; SVM не обучен' if label.startswith('label:')
+                      else 'кластер содержания; SVM не обучен')
+            result = {}
+            for index, value in training.items():
+                if value == label:
+                    for document in vectors[keys[index]]:
+                        result[document['path']] = (0, 1.0, shown, source)
+            return result, {'clusters': 1, 'clustered': len(result), 'eligible': len(candidates),
+                            'labels': len(frequencies), 'ambiguous': ambiguous}
+
+        indices = sorted(training)
+        # Lower C means a wider geometric margin and less sensitivity to noisy
+        # weak labels from filenames.
+        model = LinearSVC(C=.25, class_weight='balanced', dual='auto', random_state=0)
+        model.fit(embedding[indices], [training[index] for index in indices],
+                  sample_weight=[training_support.get(index, 1) for index in indices])
+        scores = model.decision_function(embedding)
+        if scores.ndim == 1:
+            scores = np.column_stack((-scores, scores))
+        classes = list(model.classes_)
+        centroids, thresholds = {}, {}
+        for label in classes:
+            member_indices = [index for index, value in training.items() if value == label]
+            centroid = np.asarray(embedding[member_indices].mean(axis=0)).ravel()
+            centroid /= np.linalg.norm(centroid) or 1
+            similarities = embedding[member_indices] @ centroid
+            centroids[label] = centroid
+            thresholds[label] = max(.12, float(np.quantile(similarities, .1)) - .12)
+
+        # E5 may reveal that two filename labels or two HDBSCAN fragments are
+        # really the same semantic class. Merge only very close centroids; a
+        # shared phrase component permits a slightly lower threshold.
+        class_parents = {label: label for label in classes}
+        def class_find(label):
+            while class_parents[label] != label:
+                class_parents[label] = class_parents[class_parents[label]]
+                label = class_parents[label]
+            return label
+        def class_union(left, right):
+            left, right = class_find(left), class_find(right)
+            if left != right:
+                class_parents[right] = left
+        for offset, left in enumerate(classes):
+            for right in classes[offset + 1:]:
+                left_words = set(left.removeprefix('label:').split('_'))
+                right_words = set(right.removeprefix('label:').split('_'))
+                threshold = .90 if left.startswith('label:') and right.startswith('label:') and left_words & right_words else .97
+                if float(centroids[left] @ centroids[right]) >= threshold:
+                    class_union(left, right)
+        merged_classes = sorted({class_find(label) for label in classes})
+        representatives = {}
+        for root in merged_classes:
+            members = [label for label in classes if class_find(label) == root]
+            representatives[root] = max(members, key=lambda label: (class_counts[label], -len(label), label))
+
+        result, numeric = {}, {label: index for index, label in enumerate(merged_classes)}
+        for index, key in enumerate(keys):
+            if index in training:
+                label, confidence = training[index], 1.0
+            else:
+                order = np.argsort(scores[index])
+                best, second = int(order[-1]), int(order[-2])
+                label = classes[best]
+                margin = float(scores[index, best] - scores[index, second])
+                similarity = float(embedding[index] @ centroids[label])
+                if margin < .15 or similarity < thresholds[label]:
+                    continue
+                confidence = min(.99, max(.51, .55 + .2 * margin + .2 * similarity))
+            root = class_find(label)
+            representative = representatives[root]
+            source = 'метка из имени/пути' if representative.startswith('label:') else 'кластер содержания'
+            if root != label or representative != label:
+                source += '; объединён близкий E5-класс'
+            shown = representative.removeprefix('label:')
+            for document in vectors[key]:
+                result[document['path']] = (numeric[root], confidence, shown, source)
+        return result, {'clusters': len({value[0] for value in result.values()}),
+                        'clustered': len(result), 'eligible': len(candidates),
+                        'labels': len(frequencies), 'ambiguous': ambiguous}
     except Exception:
         return {}, {'clusters': 0, 'clustered': 0, 'eligible': len(candidates),
                     'error': 'ML-кластеризация недоступна'}
+
+
+def metadata_order(documents, cancel, progress=lambda count: None, distance_threshold=.35):
+    """Average-link clustering over semantic, lexical and optional layout vectors."""
+    from .embeddings import EMBEDDING_VERSION, unpack_embedding
+    import numpy as np
+    from sklearn.cluster import AgglomerativeClustering
+
+    candidates, unmatched = [], []
+    for document in documents:
+        signature = document.get('similarity', {})
+        if signature.get('embedding_version') == EMBEDDING_VERSION and signature.get('embedding'):
+            try:
+                semantic = unpack_embedding(signature['embedding'])
+                try:
+                    lexical = unpack_embedding(signature.get('metadata_lexical', ''))
+                except (ValueError, TypeError, zlib.error, base64.binascii.Error):
+                    lexical = np.zeros_like(semantic)
+                try:
+                    layout = unpack_embedding(signature.get('layout_embedding', ''))
+                except (ValueError, TypeError, zlib.error, base64.binascii.Error):
+                    layout = None
+                candidates.append((document, semantic, lexical, layout))
+            except (ValueError, TypeError):
+                unmatched.append(document)
+        else:
+            unmatched.append(document)
+    if cancel.is_set():
+        return None
+
+    buckets = []
+    if len(candidates) >= 2:
+        # sklearn/scipy require several dense copies in addition to our matrix.
+        # Fail visibly before a large allocation can exhaust the desktop process.
+        if len(candidates) ** 2 * 32 > 1024 ** 3:
+            raise ValueError('Для попарной группировки слишком много документов: оценка памяти превышает 1 ГиБ. Откройте меньший каталог.')
+        distances = np.zeros((len(candidates), len(candidates)), dtype=np.float32)
+        for left in range(len(candidates)):
+            if cancel.is_set():
+                return None
+            _, semantic_left, lexical_left, layout_left = candidates[left]
+            for right in range(left):
+                _, semantic_right, lexical_right, layout_right = candidates[right]
+                semantic_similarity = float(semantic_left @ semantic_right)
+                if np.linalg.norm(lexical_left) and np.linalg.norm(lexical_right):
+                    text_similarity = .60 * semantic_similarity + .40 * float(lexical_left @ lexical_right)
+                else:
+                    text_similarity = semantic_similarity
+                similarity = text_similarity
+                if layout_left is not None and layout_right is not None:
+                    layout_similarity = float(layout_left @ layout_right)
+                    # A highly similar page template can rescue reports whose
+                    # actual period text differs, but cannot act alone.
+                    similarity = max(similarity, .55 * text_similarity + .45 * layout_similarity)
+                distances[left, right] = distances[right, left] = 1 - np.clip(similarity, -1, 1)
+        labels = AgglomerativeClustering(
+            n_clusters=None, metric='precomputed', linkage='average',
+            distance_threshold=distance_threshold,
+        ).fit_predict(distances)
+        grouped = defaultdict(list)
+        for index, label in enumerate(labels):
+            grouped[int(label)].append(index)
+        buckets = [indices for indices in grouped.values() if len(indices) > 1]
+        unmatched.extend(candidates[indices[0]][0] for indices in grouped.values() if len(indices) == 1)
+    elif candidates:
+        unmatched.append(candidates[0][0])
+
+    buckets.sort(key=lambda indices: (
+        -len(indices), min(candidates[index][0]['path'].casefold() for index in indices)))
+    ranks, groups, notes = {}, {}, {}
+    for group, indices in enumerate(buckets):
+        for index in sorted(indices, key=lambda value: candidates[value][0]['path'].casefold()):
+            document = candidates[index][0]
+            path = document['path']
+            peers = [1 - float(distances[index, other]) for other in indices if other != index]
+            confidence = sum(peers) / len(peers)
+            signature = document.get('similarity', {})
+            entities = Counter(signature.get('metadata_entities', {}))
+            entities.update(signature.get('ner_entities', {}))
+            recognized = [label for key, label in (
+                ('person', 'ФИО'), ('per', 'ФИО'), ('org', 'организации'), ('loc', 'места'),
+                ('date', 'даты'), ('number', 'номера')) if entities.get(key)]
+            recognized = list(dict.fromkeys(recognized))
+            suffix = f"; распознаны: {', '.join(recognized)}" if recognized else ''
+            if signature.get('metadata_refresh_failed'):
+                suffix += '; обновить название не удалось, использованы прежние признаки'
+            elif signature.get('content_embedding_legacy'):
+                suffix += '; основа содержания из прежнего смешанного кэша'
+            pages = signature.get('sampled_pages', 0)
+            ocr_pages = signature.get('ocr_pages', 0)
+            provider = {'DmlExecutionProvider': 'GPU DirectML',
+                        'CUDAExecutionProvider': 'GPU CUDA',
+                        'CPUExecutionProvider': 'CPU'}.get(signature.get('ocr_provider'), '')
+            provider_text = f' ({provider})' if provider and ocr_pages else ''
+            page_signal = (f'; страницы: {pages}, OCR: {ocr_pages}, макет: '
+                           f"{'да' if signature.get('layout_embedding') else 'нет'}{provider_text}") if pages else ''
+            ranks[path], groups[path] = len(ranks), group
+            notes[path] = (f'Группа по embeddings текста/названия/пути и доступного макета; '
+                           f'порог близости: {1 - distance_threshold:.0%}; '
+                           f'средняя близость к группе: {confidence:.0%}{page_signal}{suffix}. '
+                           'OCR-текст не сохраняется.')
+            progress(len(ranks))
+
+    next_group = len(buckets)
+    for document in sorted(unmatched, key=lambda item: item['path'].casefold()):
+        if cancel.is_set():
+            return None
+        path = document['path']
+        ranks[path], groups[path] = len(ranks), next_group
+        next_group += 1
+        signature = document.get('similarity', {})
+        if signature.get('embedding_failed'):
+            notes[path] = 'Embedding построить не удалось; файл оставлен отдельно.'
+        else:
+            notes[path] = ('Сходства текста, названия, пути или макета выше порога не найдено; '
+                           'файл оставлен отдельно. OCR-текст не сохраняется.')
+        progress(len(ranks))
+    return ranks, groups, notes
 
 
 def physical_key(document):
@@ -685,9 +925,14 @@ def content_order(documents, cancel, progress=lambda count: None):
             reasons = []
             if path in content_notes:
                 reasons.append(content_notes[path])
-            label, probability = semantic.get(path, (-1, 0))
+            label, probability, class_name, source = semantic.get(path, (-1, 0, '', ''))
             if label >= 0:
-                reasons.append(f'Тематическая группа ML (TF-IDF + LSA + HDBSCAN), уверенность: {probability:.0%}; не признак дубля')
+                embedding_source = document.get('content', {}).get('embedding_source', 'content')
+                source_names = {'content': 'содержимое', 'content+metadata': 'содержимое + имя/путь',
+                                'metadata': 'только имя/путь'}
+                reasons.append(f'SVM-класс «{class_name}» ({source}), уверенность: {probability:.0%}; '
+                               f'E5: {source_names.get(embedding_source, embedding_source)}; '
+                               'слабая локальная метка, не признак дубля')
             if reasons:
                 notes[path] = ' · '.join(reasons)
     unmatched.extend(document for extension in large.values() for document in extension)

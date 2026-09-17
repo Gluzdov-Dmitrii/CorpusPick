@@ -3,6 +3,9 @@ import ctypes
 from ctypes import wintypes
 from pathlib import Path
 
+MAX_EXPLORER_WINDOWS = 12
+MAX_EXPLORER_ITEMS = 512
+
 
 def show_file(path):
     show_files([path])
@@ -16,6 +19,15 @@ def show_files(paths):
         folders.setdefault(path.parent, []).append(path)
     if not folders:
         return
+    total = sum(len(files) for files in folders.values())
+    if len(folders) > MAX_EXPLORER_WINDOWS:
+        raise ValueError(
+            f'Выбрано файлов из {len(folders)} папок. Чтобы не перегружать Проводник, '
+            f'выберите не больше {MAX_EXPLORER_WINDOWS} папок за раз.')
+    if total > MAX_EXPLORER_ITEMS:
+        raise ValueError(
+            f'Выбрано файлов: {total}. Чтобы не перегружать Проводник, '
+            f'выберите не больше {MAX_EXPLORER_ITEMS} файлов за раз.')
     shell = ctypes.WinDLL('shell32')
     ole = ctypes.WinDLL('ole32')
     ole.CoInitializeEx.argtypes = [ctypes.c_void_p, wintypes.DWORD]

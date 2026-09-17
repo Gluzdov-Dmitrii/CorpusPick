@@ -8,10 +8,50 @@ from zipfile import ZipFile, ZIP_DEFLATED, ZIP_STORED
 
 from corpuspick.core import Session
 from corpuspick.content_similarity import (fingerprint, evidence, content_order, text_fingerprint,
-                                           semantic_layout, visual_similarity, TOPIC_VERSION)
+                                           metadata_order, semantic_layout, visual_similarity,
+                                           weak_label_candidates)
+from corpuspick.embeddings import EMBEDDING_VERSION, metadata_features, pack_embedding
 
 
 class ContentTests(unittest.TestCase):
+    def test_renamed_pdf_refresh_sends_cached_vectors_without_ocr(self):
+        self.put('scan.pdf', b'Synthetic placeholder, must never be parsed')
+        session = Session(self.root, self.base / 'state', read_only=True)
+        try:
+            session.scan(hash_files=False)
+            vector = [0.] * 384
+            vector[0] = 1
+            from corpuspick.embeddings import metadata_key
+            session.state['documents'][0]['similarity'] = {
+                'embedding_version': EMBEDDING_VERSION, 'embedding': pack_embedding(vector),
+                'metadata_key': metadata_key(['scan.pdf']), 'ocr_pages': 3, 'embedding_source': 'ocr+metadata'}
+            (self.root / 'scan.pdf').rename(self.root / 'Акты_scan.pdf')
+            requests = []
+            def refresh(worker, path, cancel, request=None):
+                requests.append(request)
+                self.assertIsNone(request['path'])
+                self.assertEqual(request['cached_similarity']['ocr_pages'], 3)
+                return dict(request['cached_similarity'], metadata_key=metadata_key(request['metadata_paths']))
+            with patch('corpuspick.stats_worker.StatsWorker.count', refresh), \
+                    patch('corpuspick.embeddings.ensure_model', return_value=self.base / 'model'), \
+                    patch('corpuspick.ocr.ensure_ocr_model', side_effect=AssertionError('No OCR model needed')):
+                result = session.group_similar()
+                session.group_similar()
+            self.assertEqual(len(requests), 1)
+            self.assertIn('Акты_scan.pdf', result[1])
+            self.assertEqual(session.state['documents'][0]['similarity']['ocr_pages'], 3)
+        finally:
+            session.close()
+
+    def test_large_clustering_rejected_before_distance_allocation(self):
+        vector = [0.] * 384
+        vector[0] = 1
+        document = {'path': 'synthetic.pdf', 'similarity': {
+            'embedding_version': EMBEDDING_VERSION, 'embedding': pack_embedding(vector)}}
+        with patch('numpy.zeros', side_effect=AssertionError('No dense allocation')):
+            with self.assertRaisesRegex(ValueError, 'памяти'):
+                metadata_order([document] * 6000, threading.Event())
+
     def test_hdbscan_separates_synthetic_document_topics(self):
         themes = [
             'коммерческое предложение поставка оборудование цена стоимость заказчик условия договор срок оплаты',
@@ -25,6 +65,10 @@ class ContentTests(unittest.TestCase):
                 variant = ' ' + variants[index]
                 content = {'sha256': f'{group}-{index}'}
                 content.update(text_fingerprint([(theme + variant) * 8]))
+                vector = [0.] * 384
+                vector[group] = 1
+                vector[10 + index] = .08
+                content.update(embedding_version=EMBEDDING_VERSION, embedding=pack_embedding(vector))
                 docs.append({'path': f'{group}-{index}.pdf', 'size': 1000 + index, 'content': content})
         labels, visual = semantic_layout(docs, threading.Event())
         topic_labels = [{labels[f'{group}-{index}.pdf'][0] for index in range(5)} for group in range(3)]
@@ -36,10 +80,54 @@ class ContentTests(unittest.TestCase):
         grouped = [{groups[f'{group}-{index}.pdf'] for index in range(5)} for group in range(3)]
         self.assertTrue(all(len(group) == 1 for group in grouped))
         self.assertEqual(len(set.union(*grouped)), 3)
-        self.assertTrue(all('HDBSCAN' in notes[document['path']] for document in docs))
+        self.assertTrue(all('SVM-класс' in notes[document['path']] for document in docs))
         self.assertEqual(len(ranks), 15)
 
-    def test_existing_fingerprint_adds_only_bounded_topic_pass(self):
+    def test_svm_uses_frequent_labels_handles_overlap_and_builds_other_class(self):
+        def item(path, theme, index, group):
+            content = {'sha256': path}
+            content.update(text_fingerprint([(theme + f' вариант{index} приложение{index} ') * 8]))
+            vector = [0.] * 384
+            vector[group] = 1
+            vector[20 + index] = .08
+            content.update(embedding_version=EMBEDDING_VERSION, embedding=pack_embedding(vector))
+            return {'path': path, 'size': 1000 + index, 'content': content}
+
+        acts = 'акт приемка выполненные работы комиссия результат '
+        agreements = 'дополнительное соглашение договор условия срок сторона '
+        diplomas = 'диплом исследование университет кафедра работа защита '
+        docs = []
+        for index in range(5):
+            docs.append(item(f'a{index}/АКТ Приемки {index}.pdf', acts, index, 0))
+            docs.append(item(f'd{index}/дс соглашение {index}.pdf', agreements, 10 + index, 1))
+        people = ['Иванов Сергей', 'Петров Антон', 'Сидоров Павел',
+                  'Орлов Илья', 'Волков Олег', 'Смирнов Роман']
+        for index, person in enumerate(people):
+            docs.append(item(f'p{index}/{person}.pdf', diplomas, 20 + index, 2))
+        docs.append(item('mixed/акт приемки дс соглашение спорный.pdf', acts, 40, 0))
+
+        weak, frequencies = weak_label_candidates(docs)
+        self.assertEqual(set(frequencies), {'акт_приемки', 'дс_соглашение'})
+        self.assertEqual(weak['a0/АКТ Приемки 0.pdf'], ['акт_приемки'])
+        self.assertEqual(weak['mixed/акт приемки дс соглашение спорный.pdf'],
+                         ['акт_приемки', 'дс_соглашение'])
+        labels, summary = semantic_layout(docs, threading.Event())
+        self.assertEqual(labels['mixed/акт приемки дс соглашение спорный.pdf'][2], 'акт_приемки')
+        self.assertEqual({labels[f'p{index}/{person}.pdf'][2] for index, person in enumerate(people)},
+                         {'other_1'})
+        self.assertEqual(summary['ambiguous'], 1)
+        self.assertEqual(summary['clusters'], 3)
+
+    def test_hyphenated_weak_label_is_one_class(self):
+        docs = [{'path': f'flat/alpha{index}.pdf',
+                 'origin': f'Технологии/ноу-хау/person{index}.pdf'} for index in range(5)]
+        docs += [{'path': f'flat/beta{index}.pdf',
+                  'origin': f'Прочее{index}/different{index}.pdf'} for index in range(5)]
+        weak, frequencies = weak_label_candidates(docs)
+        self.assertIn('ноу_хау', frequencies)
+        self.assertEqual(weak[docs[0]['path']], ['ноу_хау'])
+
+    def test_metadata_mode_does_not_read_existing_content(self):
         self.put('a.txt', ('искусственный тематический документ ' * 20).encode('utf-8'))
         session = Session(self.root, self.base / 'state', read_only=True)
         try:
@@ -49,13 +137,99 @@ class ContentTests(unittest.TestCase):
                                    'binary': [], 'chunks': [], 'words': 20,
                                    'text_sha256': 'cached-text', 'text': []}
             calls = []
-            def count(worker, path, cancel):
+            def count(worker, path, cancel, request=None):
                 calls.append(worker.target.__name__)
-                return {'topic_version': TOPIC_VERSION, 'topic_words': 20,
-                        'topic': text_fingerprint(['искусственный тематический документ ' * 20])['topic']}
-            with patch('corpuspick.stats_worker.StatsWorker.count', count):
+                vector = [0.] * 384
+                vector[0] = 1
+                return {'embedding_version': EMBEDDING_VERSION, 'embedding': pack_embedding(vector)}
+            with patch('corpuspick.stats_worker.StatsWorker.count', count), \
+                 patch('corpuspick.embeddings.ensure_model', return_value=self.base / 'model'):
                 session.group_similar()
-            self.assertEqual(calls, ['topic_worker'])
+            self.assertEqual(calls, ['embedding_worker'])
+            refreshed = session.state['documents'][0]
+            self.assertEqual(refreshed['content']['sha256'], 'cached')
+            self.assertIn('similarity', refreshed)
+        finally:
+            session.close()
+
+    def test_metadata_entities_replace_person_date_and_number_values(self):
+        features = metadata_features([r'Отчеты\Иванов Сергей\Акт от 12.03.2024 № 15.pdf'])
+        self.assertEqual(features['entity_counts'], {'person': 1, 'date': 1, 'number': 1})
+        rendered = ' '.join((features['title'], features['folders']))
+        self.assertNotIn('иванов', rendered)
+        self.assertNotIn('сергей', rendered)
+        self.assertNotIn('2024', rendered)
+        self.assertIn('персона', rendered)
+        self.assertNotIn('дата', rendered)
+        self.assertNotIn('номер', features['entities'])
+
+    def test_metadata_order_uses_only_embeddings_and_leaves_singletons_separate(self):
+        def doc(path, vector, **entities):
+            return {'path': path, 'size': 100,
+                    'similarity': {'embedding_version': EMBEDDING_VERSION,
+                                   'embedding': pack_embedding(vector),
+                                   'metadata_entities': entities}}
+        a, b, c = [0.] * 384, [0.] * 384, [0.] * 384
+        a[0], b[0], b[1], c[2] = 1, .99, .05, 1
+        documents = [doc('Акт Иванов 2023.pdf', a, person=1, date=1),
+                     doc('Акт Петров 2024.docx', b, person=1, date=1),
+                     doc('Письмо.xlsx', c)]
+        _, groups, notes = metadata_order(documents, threading.Event())
+        self.assertEqual(groups[documents[0]['path']], groups[documents[1]['path']])
+        self.assertNotEqual(groups[documents[0]['path']], groups[documents[2]['path']])
+        self.assertIn('ФИО', notes[documents[0]['path']])
+        self.assertIn('OCR-текст не сохраняется', notes[documents[0]['path']])
+
+    def test_layout_can_join_reports_with_different_text(self):
+        semantic_a, semantic_b, semantic_c, lexical_a, lexical_b, lexical_c = ([0.] * 384 for _ in range(6))
+        semantic_a[0] = 1
+        semantic_b[0], semantic_b[1] = .65, .76
+        semantic_c[2] = 1
+        lexical_a[10], lexical_b[11], lexical_c[12] = 1, 1, 1
+        layout_same, layout_other = [0.] * 384, [0.] * 384
+        layout_same[20], layout_other[21] = 1, 1
+        def doc(path, semantic, lexical, layout):
+            return {'path': path, 'similarity': {
+                'embedding_version': EMBEDDING_VERSION,
+                'embedding': pack_embedding(semantic),
+                'metadata_lexical': pack_embedding(lexical),
+                'layout_embedding': pack_embedding(layout),
+                'sampled_pages': 3}}
+        documents = [doc('report-a.pdf', semantic_a, lexical_a, layout_same),
+                     doc('report-b.pdf', semantic_b, lexical_b, layout_same),
+                     doc('different-layout.pdf', semantic_c, lexical_c, layout_other)]
+        _, groups, _ = metadata_order(documents, threading.Event())
+        self.assertEqual(groups['report-a.pdf'], groups['report-b.pdf'])
+        self.assertNotEqual(groups['report-a.pdf'], groups['different-layout.pdf'])
+
+    def test_grouping_threshold_controls_granularity(self):
+        first, second = [0.] * 384, [0.] * 384
+        first[0] = 1
+        second[0], second[1] = .75, (1 - .75 ** 2) ** .5
+        documents = [
+            {'path': 'first.pdf', 'similarity': {
+                'embedding_version': EMBEDDING_VERSION, 'embedding': pack_embedding(first)}},
+            {'path': 'second.pdf', 'similarity': {
+                'embedding_version': EMBEDDING_VERSION, 'embedding': pack_embedding(second)}},
+        ]
+        _, strict_groups, _ = metadata_order(documents, threading.Event(), distance_threshold=.20)
+        _, broad_groups, notes = metadata_order(documents, threading.Event(), distance_threshold=.30)
+        self.assertNotEqual(strict_groups['first.pdf'], strict_groups['second.pdf'])
+        self.assertEqual(broad_groups['first.pdf'], broad_groups['second.pdf'])
+        self.assertIn('порог близости: 70%', notes['first.pdf'])
+
+    def test_regroup_uses_cached_vectors_without_scan(self):
+        self.put('cached.pdf', b'synthetic')
+        session = Session(self.root, self.base / 'state', read_only=True)
+        try:
+            session.open_catalog()
+            vector = [0.] * 384
+            vector[0] = 1
+            session.state['documents'][0]['similarity'] = {
+                'embedding_version': EMBEDDING_VERSION, 'embedding': pack_embedding(vector)}
+            with patch.object(session, 'scan', side_effect=AssertionError('regroup must not scan')):
+                result = session.regroup_similar(.42)
+            self.assertIn('cached.pdf', result[1])
         finally:
             session.close()
 
@@ -75,18 +249,25 @@ class ContentTests(unittest.TestCase):
         self.put('a.zip', b'synthetic archive')
         session = Session(self.root, self.base / 'state', read_only=True)
         try:
-            # A lowered threshold exercises the real scan without allocating GB files.
+            vector = [0.] * 384
+            vector[0] = 1
+            def metadata_count(worker, path, cancel, request=None):
+                self.assertIsNotNone(request)
+                return {'embedding_version': EMBEDDING_VERSION, 'embedding': pack_embedding(vector)}
+            # Metadata mode handles every size without opening document bytes.
             with patch('corpuspick.content_similarity.MAX_CONTENT_BYTES', 4), \
-                 patch('corpuspick.stats_worker.StatsWorker.count', side_effect=AssertionError('Must not read large file')):
+                 patch('corpuspick.stats_worker.StatsWorker.count', metadata_count), \
+                 patch('corpuspick.embeddings.ensure_model', return_value=self.base / 'model'):
                 result = session.group_similar()
-                self.assertIn('Только тип и размер', result[2]['a.zip'])
+                self.assertIn('оставлен отдельно', result[2]['a.zip'])
             doc = session.state['documents'][0]
             doc.update(content={'sha256': 'synthetic'}, hash='keep', origin='original/a.zip', stats={'pages': 2})
             session.clear_similarity_cache()
             session.close()
             session = Session(self.root, self.base / 'state', read_only=True)
             doc = session.state['documents'][0]
-            self.assertNotIn('content', doc)
+            self.assertEqual(doc['content'], {'sha256': 'synthetic'})
+            self.assertNotIn('similarity', doc)
             self.assertEqual(doc['origin'], 'original/a.zip')
             self.assertEqual(doc['hash'], 'keep')
             self.assertEqual(doc['stats'], {'pages': 2})
@@ -243,14 +424,27 @@ class ContentTests(unittest.TestCase):
         b = self.put('completely-different.bin', data[:500] + b'ABC' + data[503:])
         session = Session(self.root, self.base / 'state', read_only=True)
         try:
-            result = session.group_similar()
+            vector = [0.] * 384
+            vector[0] = 1
+            def metadata_count(worker, path, cancel, request=None):
+                return {'embedding_version': EMBEDDING_VERSION, 'embedding': pack_embedding(vector)}
+            with patch('corpuspick.stats_worker.StatsWorker.count', metadata_count), \
+                 patch('corpuspick.embeddings.ensure_model', return_value=self.base / 'model'):
+                result = session.group_similar()
             self.assertEqual(len(set(result[1].values())), 1)
             self.assertEqual(session.duplicate_plan(), [])
             with patch('corpuspick.stats_worker.StatsWorker.count', side_effect=AssertionError('Use cached signature')):
                 session.group_similar()
             b.write_bytes(random.Random(22).randbytes(4096))
-            result = session.group_similar()
-            self.assertTrue(all('выше порога не найдено' in result[2][path.name] for path in (a, b)))
+            calls = []
+            def recount(worker, path, cancel, request=None):
+                calls.append(path)
+                return {'embedding_version': EMBEDDING_VERSION, 'embedding': pack_embedding(vector)}
+            with patch('corpuspick.stats_worker.StatsWorker.count', recount), \
+                 patch('corpuspick.embeddings.ensure_model', return_value=self.base / 'model'):
+                result = session.group_similar()
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(len(set(result[1].values())), 1)
             self.assertEqual(a.read_bytes(), data)
             session.cancel.set()
             self.assertIsNone(session.group_similar())
@@ -268,20 +462,25 @@ class ContentTests(unittest.TestCase):
         self.put('b.bin', random.Random(2).randbytes(4000))
         session = Session(self.root, self.base / 'state', read_only=True)
         try:
+            vector = [0.] * 384
+            vector[0] = 1
+            def metadata_count(worker, path, cancel, request=None):
+                return {'embedding_version': EMBEDDING_VERSION, 'embedding': pack_embedding(vector)}
             def stop_after_first(_):
-                if any(d.get('content') for d in session.state['documents']):
+                if any(d.get('similarity') for d in session.state['documents']):
                     session.cancel.set()
-            self.assertIsNone(session.group_similar(stop_after_first))
-            self.assertEqual(sum(bool(d.get('content')) for d in session.state['documents']), 1)
+            with patch('corpuspick.stats_worker.StatsWorker.count', metadata_count), \
+                 patch('corpuspick.embeddings.ensure_model', return_value=self.base / 'model'):
+                self.assertIsNone(session.group_similar(stop_after_first))
+            self.assertEqual(sum(bool(d.get('similarity')) for d in session.state['documents']), 1)
             session.close()
             session = Session(self.root, self.base / 'state', read_only=True)
-            from corpuspick.stats_worker import StatsWorker
-            original = StatsWorker.count
             calls = []
-            def count(worker, path, cancel):
+            def count(worker, path, cancel, request=None):
                 calls.append(path)
-                return original(worker, path, cancel)
-            with patch.object(StatsWorker, 'count', count):
+                return {'embedding_version': EMBEDDING_VERSION, 'embedding': pack_embedding(vector)}
+            with patch('corpuspick.stats_worker.StatsWorker.count', count), \
+                 patch('corpuspick.embeddings.ensure_model', return_value=self.base / 'model'):
                 session.group_similar()
             self.assertEqual(len(calls), 1)
         finally:

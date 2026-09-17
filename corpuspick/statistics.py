@@ -1,9 +1,6 @@
 """Document composition, never document previews or content logs."""
-import json
 import logging
-import os
 from pathlib import Path
-import subprocess
 from xml.etree import ElementTree as ET
 from zipfile import ZipFile
 
@@ -64,26 +61,5 @@ def document_stats(path):
             props = document.getproperties('\x05SummaryInformation') if document.exists('\x05SummaryInformation') else {}
             pages = props.get(14)
             return {'pages': pages if isinstance(pages, int) and pages > 0 else None, 'pages_estimated': True,
-                    'info': 'DOC: сохранённые страницы (могут устареть). Рисунки и таблицы требуют кнопки «Уточнить Word».'}
+                    'info': 'DOC: сохранённые страницы (могут устареть); точную статистику можно уточнить через LibreOffice.'}
     return {'info': 'Подсчёт состава для этого формата не поддерживается'}
-
-
-def word_stats(path):
-    if os.name != 'nt':
-        return {'info': 'Подсчёт через Word доступен в Windows'}
-    env = os.environ.copy()
-    env['CORPUSPICK_DOCUMENT'] = str(path.resolve())
-    script = Path(__file__).with_name('word_stats.ps1')
-    try:
-        process = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-                                  '-File', str(script)], env=env, capture_output=True, timeout=150,
-                                 creationflags=subprocess.CREATE_NO_WINDOW)
-        if process.returncode:
-            return {'info': 'Word недоступен или не смог открыть документ'}
-        result = json.loads(process.stdout.decode('utf-8-sig').strip())
-        if 'pages' in result:
-            result['info'] = 'Word: страницы после перевёрстки; рисунки — InlineShapes + Shapes; таблицы основного текста. Файл не сохранялся.'
-            result.pop('appendices', None)
-        return result
-    except (subprocess.TimeoutExpired, OSError, ValueError):
-        return {'info': 'Word не ответил за отведённое время или недоступен'}

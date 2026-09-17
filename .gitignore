@@ -21,3 +21,10 @@ node_modules/
 __pycache__/
 *.py[cod]
 .venv/
+
+# Machine-specific service repair backups and results
+/agents/nvidia-container-service-before.reg
+/agents/nvidia-service-change-result.json
+/agents/disable-nvidia-container.ps1
+/agents/SYSTEM_DIAGNOSIS_2026-09-15.md
+.pytest_cache/

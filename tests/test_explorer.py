@@ -5,7 +5,7 @@ import time
 import unittest
 from urllib.parse import unquote
 
-from corpuspick.explorer import show_file, show_files
+from corpuspick.explorer import MAX_EXPLORER_WINDOWS, show_file, show_files
 
 
 class ExplorerTests(unittest.TestCase):
@@ -13,6 +13,18 @@ class ExplorerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaises(FileNotFoundError):
                 show_file(Path(directory) / 'missing.txt')
+
+    def test_refuses_too_many_explorer_windows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = []
+            for index in range(MAX_EXPLORER_WINDOWS + 1):
+                folder = Path(directory) / f'folder-{index}'
+                folder.mkdir()
+                path = folder / 'file.txt'
+                path.write_text('Synthetic fixture', encoding='utf-8')
+                paths.append(path)
+            with self.assertRaises(ValueError):
+                show_files(paths)
 
     @unittest.skipUnless(os.environ.get('CORPUSPICK_TEST_EXPLORER') == '1', 'Optional synthetic Explorer integration')
     def test_select_file_with_spaces_unicode_and_comma(self):
