@@ -96,7 +96,7 @@ def test_clear_cache_only_removes_owned_files(tmp_path, monkeypatch):
 def test_prerender_budget_continue_and_enough(tmp_path, monkeypatch):
     from types import SimpleNamespace
     monkeypatch.setenv('LOCALAPPDATA', str(tmp_path))
-    monkeypatch.setattr(preview, 'image_cache_size', lambda: 512 * 1024 * 1024)
+    monkeypatch.setattr(preview, 'image_cache_size', lambda: 2 * 1024 * 1024 * 1024)
     docs = []
     for suffix in ('.docx', '.pdf', '.pptx'):
         path = tmp_path / ('synthetic' + suffix)

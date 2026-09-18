@@ -1439,7 +1439,7 @@ class App:
         dialog.withdraw()
         dialog.title('Размер кэша preview')
         dialog.transient(self.window)
-        text = ('Рекомендуемый размер кэша 512 МиБ достигнут.\n'
+        text = ('Размер кэша достиг 2 ГиБ.\n'
                 f'Общий кэш всех каталогов: {size / (1024 * 1024):.1f} МиБ.\n\n'
                 f'В текущем пререндере осталось файлов: {sum(counts.values())}.\n'
                 'Без готового preview по форматам:\n' +
@@ -1495,12 +1495,12 @@ class App:
             with budget_lock:
                 if operation_cancel.is_set() or result['stopped']:
                     return False
-                if budget['accepted'] or budget['size'] < 512 * 1024 * 1024:
+                if budget['accepted'] or budget['size'] < 2 * 1024 * 1024 * 1024:
                     return True
                 # Recheck actual disk usage only near the threshold, not on every hit.
                 size = image_cache_size()
                 budget['size'] = size
-                if size < 512 * 1024 * 1024:
+                if size < 2 * 1024 * 1024 * 1024:
                     return True
                 counts = {}
                 for document in docs:
