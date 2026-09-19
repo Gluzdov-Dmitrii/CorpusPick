@@ -12,7 +12,7 @@ import zlib
 
 MODEL_NAME = 'multilingual-e5-small-int8'
 MODEL_REVISION = '761b726dd34fb83930e26aab4e9ac3899aa1fa78'
-EMBEDDING_VERSION = 5
+EMBEDDING_VERSION = 6
 EMBEDDING_DIMENSIONS = 384
 MAX_TOKENS = 512
 MODEL_FILES = {
@@ -273,7 +273,7 @@ def _metadata_passages(features, has_content):
 
 
 def reusable_similarity(signature):
-    return (signature.get('embedding_version') in (4, EMBEDDING_VERSION)
+    return (signature.get('embedding_version') == EMBEDDING_VERSION
             and bool(signature.get('embedding')) and not signature.get('embedding_failed'))
 
 

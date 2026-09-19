@@ -60,6 +60,30 @@ class DummyWindow:
 
 
 class GuiSmokeTest(unittest.TestCase):
+    def test_multiselection_preview_follows_last_selected_not_row_order(self):
+        app = App.__new__(App)
+        docs = [{'path': path, 'size': 1} for path in ('a.pdf', 'b.pdf', 'c.pdf')]
+        app.view_docs = docs
+        app.totals, app.details = DummyStatus(), DummyStatus()
+        app.preview_visible = SimpleNamespace(get=lambda: True)
+        selected = [docs[0], docs[2]]
+        focus = ['c.pdf']
+        app.tree = SimpleNamespace(focus=lambda: focus[0])
+        app.selected_documents = lambda: selected
+        previews = []
+        app.schedule_preview = lambda d: previews.append(d['path'])
+        app.select()
+        self.assertEqual(previews[-1], 'c.pdf')
+        selected[:] = docs
+        focus[0] = 'b.pdf'
+        app.select()
+        self.assertEqual(previews[-1], 'b.pdf')
+        app.select()  # Redraw preserves the most recent selection.
+        self.assertEqual(previews[-1], 'b.pdf')
+        selected.remove(docs[1])
+        app.select()
+        self.assertEqual(previews[-1], 'c.pdf')
+
     def test_similarity_slider_only_commits_on_release(self):
         app = App.__new__(App)
         app.similarity_threshold_text = DummyStatus()

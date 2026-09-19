@@ -6,7 +6,7 @@ from pathlib import Path
 import re
 import unicodedata
 
-OCR_VERSION = 1
+OCR_VERSION = 2
 OCR_DPI = 120
 OCR_MODEL_NAME = 'rapidocr-cyrillic-v5'
 OCR_MODEL_FILE = 'cyrillic_PP-OCRv5_rec_mobile.onnx'
@@ -177,7 +177,7 @@ def _native_blocks(page, scale_x=1.0, scale_y=1.0):
 
 
 def sample_pdf(path, ocr_engine):
-    """Read at most first/middle/last PDF pages and return no persistent text."""
+    """Read only the first PDF page and return no persistent text."""
     import numpy as np
     import pymupdf
     document = pymupdf.open(path)
@@ -185,7 +185,7 @@ def sample_pdf(path, ocr_engine):
         if not document.page_count:
             return {'texts': [], 'layout': np.zeros(LAYOUT_DIMENSIONS, dtype=np.float32),
                     'sampled_pages': 0, 'ocr_pages': 0, 'native_pages': 0}
-        slots = [0, document.page_count // 2, document.page_count - 1]
+        slots = [0]
         cache, texts, layouts = {}, [], []
         ocr_pages = native_pages = 0
         for index in slots:
@@ -212,7 +212,9 @@ def sample_pdf(path, ocr_engine):
                 ocr_pages += 1
             else:
                 native_pages += 1
-        layout = np.concatenate(layouts).astype(np.float32)
+        # Keep the vector schema compatible; unused page slots contain no signal.
+        layout = np.zeros(LAYOUT_DIMENSIONS, dtype=np.float32)
+        layout[:128] = layouts[0]
         norm = float(np.linalg.norm(layout))
         if norm:
             layout /= norm

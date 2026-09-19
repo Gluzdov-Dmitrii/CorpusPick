@@ -12,6 +12,12 @@ from corpuspick.stats_worker import StatsWorker
 
 
 class EmbeddingTests(unittest.TestCase):
+    def test_three_page_cache_cannot_be_reused(self):
+        from corpuspick.embeddings import reusable_similarity, EMBEDDING_VERSION
+        for version in (4, 5):
+            self.assertFalse(reusable_similarity({'embedding_version': version, 'embedding': 'old'}))
+        self.assertTrue(reusable_similarity({'embedding_version': EMBEDDING_VERSION, 'embedding': 'current'}))
+
     def test_split_content_refresh_matches_full_encode_without_extraction(self):
         import hashlib
         import numpy as np

@@ -95,14 +95,17 @@ class TrashTests(unittest.TestCase):
         self.assertFalse(path.exists())
         self.assertEqual(result['trashed'], 1)
 
-    def test_pending_move_blocks_trash(self):
+    def test_pending_move_is_cancelled_before_trash(self):
         self.put('a.txt')
         document = self.session.scan()[0]
-        self.session.state['moves'] = [{'done': False}]
-        with patch('corpuspick.core.recycle_file') as recycle:
-            with self.assertRaises(ValueError):
-                self.session.trash_documents([document])
-            recycle.assert_not_called()
+        self.session.state['moves'] = [dict(
+            source='a.txt', destination='renamed.txt', done=False)]
+        with patch('corpuspick.core.recycle_file', self.fake_recycle):
+            result = self.session.trash_documents([document])
+        self.assertEqual(result['trashed'], 1)
+        self.assertFalse((self.root / 'a.txt').exists())
+        self.assertFalse((self.root / 'renamed.txt').exists())
+        self.assertFalse(any(not move['done'] for move in self.session.state['moves']))
 
     @unittest.skipUnless(os.name == 'nt', 'Windows shell callback')
     def test_shell_callback_refuses_permanent_delete(self):

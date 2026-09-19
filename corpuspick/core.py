@@ -48,6 +48,8 @@ def failure(error):
     code = getattr(error, "winerror", None) or getattr(error, "errno", None)
     if isinstance(error, FileNotFoundError):
         return "Файл уже перемещён или удалён в Explorer"
+    if code in (206, 36):
+        return 'Слишком длинное имя или путь: используйте 🔧 → «Сократить длинные названия»'
     if code in (32, 33):
         return "Файл занят: закройте его в редакторе или Preview и повторите"
     if isinstance(error, PermissionError):
@@ -140,6 +142,8 @@ class Session:
             if self.state.get("version") != 1:
                 raise ValueError("Неизвестный формат сессии.")
             self.replay_journal()
+            from .path_repair import recover
+            recover(self)
         except Exception:
             self.close()
             raise
@@ -407,7 +411,7 @@ class Session:
         needs_ocr = any(Path(document['path']).suffix.lower() == '.pdf' and
                         not reusable_similarity(document.get('similarity', {})) for document in pending_embeddings)
         ocr_model = ensure_ocr_model(self.data_root, self.cancel) if needs_ocr else None
-        # Only bounded views are read: three PDF pages or three text excerpts.
+        # Only bounded views are read: first PDF page or three text excerpts.
         # OCR text stays inside the worker; only embeddings/layout/entity counts return.
         with StatsWorker(timeout=180, target=embedding_worker, retry_label='По похожести',
                          init_args=(str(model_dir), str(ocr_model) if ocr_model else None)) as worker:
@@ -492,7 +496,7 @@ class Session:
     def trash_documents(self, documents=None, duplicate_plan=None, progress=lambda count: None):
         self.require_write()
         if any(not m['done'] for m in self.state['moves']):
-            raise ValueError('Сначала завершите перенос')
+            self.cancel_pending()
         result = {'trashed': 0, 'errors': []}
         removed_paths = set()
         entries = duplicate_plan if duplicate_plan is not None else [{'remove': d} for d in documents or []]
@@ -539,7 +543,7 @@ class Session:
     def _rename_documents(self, documents, make_name, progress):
         self.require_write()
         if any(not m['done'] for m in self.state['moves']):
-            raise ValueError('Сначала завершите перенос')
+            self.cancel_pending()
         pending, errors = [], []
         reserved = set()
         for document in documents:
@@ -760,17 +764,35 @@ class Session:
         return {"removed": removed, "errors": errors}
 
     def cancel_pending(self):
+        """Reconcile completed moves, discard unexecuted intentions, touch no files."""
         self.require_write()
-        for move in self.state["moves"]:
-            if move["done"]:
+        recovered = []
+        for move in self.state['moves']:
+            if move['done']:
                 continue
-            source = Path(native(self.safe_path(move["source"])))
-            destination = Path(native(self.safe_path(move["destination"])))
-            if not source.exists() and destination.exists():
-                raise ValueError("Сначала продолжите перенос: один из файлов уже находится только в корне")
-            if source.exists() and destination.exists() and os.path.samefile(source, destination):
-                destination.unlink()
-        self.state["moves"] = [m for m in self.state["moves"] if m["done"]]
+            source = Path(native(self.safe_path(move['source'])))
+            destination = Path(native(self.safe_path(move['destination'])))
+            if source.exists():
+                # Including collisions/legacy hard links: keep both files intact.
+                continue
+            if not destination.is_file():
+                # Neither file exists: a stale intention cannot be executed.
+                continue
+            info = destination.stat()
+            identity = [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns]
+            if not (move.get('identity') == identity or
+                    move.get('hash') and digest(destination, self.cancel) == move['hash']):
+                raise ValueError('Не удалось подтвердить результат прерванной операции. '
+                                 'Файлы сохранены без изменений; обновите список (F5).')
+            recovered.append(move)
+        for move in recovered:
+            move['done'] = True
+            move.pop('error', None)
+            for document in self.state['documents']:
+                if document['path'] in (move['source'], move['destination']):
+                    document['path'] = move['destination']
+                    document['origin'] = move['origin']
+        self.state['moves'] = [m for m in self.state['moves'] if m['done']]
         self.save()
 
     def unlock(self, progress=lambda count: None):

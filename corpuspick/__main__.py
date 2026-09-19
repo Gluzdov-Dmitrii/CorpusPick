@@ -132,6 +132,13 @@ class App:
             self.buttons.append(b)
             if fn not in (self.open_folder, self.find_duplicates):
                 self.mutation_buttons.append(b)
+        fixes = ttk.Menubutton(main, text='🔧', width=3)
+        fixes.pack(side='left', padx=(0, 6))
+        fixes_menu = tk.Menu(fixes, tearoff=False)
+        fixes_menu.add_command(label='Сократить длинные названия…', command=self.shorten_long_paths)
+        fixes.configure(menu=fixes_menu)
+        self.buttons.append(fixes)
+        self.mutation_buttons.append(fixes)
         self.backup_check = ttk.Checkbutton(main, text='Бэкап: открыть без изменений', variable=self.backup_mode)
         self.backup_check.pack(side='left')
         actions = ttk.Frame(window, padding=(10, 3))
@@ -981,6 +988,14 @@ class App:
 
     def select(self, _=None):
         docs = self.selected_documents()
+        paths = {d['path'] for d in docs}
+        history = [path for path in getattr(self, 'selection_history', []) if path in paths]
+        added = [d['path'] for d in docs if d['path'] not in history]
+        focused = self.tree.focus()
+        if focused in added:
+            added.remove(focused)
+            added.append(focused)
+        self.selection_history = history + added
         self.totals.set(totals_text(docs or self.view_docs, selected=bool(docs)) + ' · > неполный подсчёт; ≈ сохранённые страницы')
         if len(docs) == 1:
             d = docs[0]
@@ -992,7 +1007,10 @@ class App:
             self.schedule_preview(d)
         else:
             self.details.set(f'Выделено: {len(docs)} · Ctrl/Shift — выбор · Ctrl+A — все видимые · Esc — снять выбор / стоп · Delete — корзина')
-            if self.preview_visible.get():
+            if docs:
+                latest = self.selection_history[-1]
+                self.schedule_preview(next(d for d in docs if d['path'] == latest))
+            elif self.preview_visible.get():
                 self.cancel_preview()
                 self.preview_placeholder('Выберите один файл в списке.')
 
@@ -1021,7 +1039,7 @@ class App:
     def clear_similarity_cache(self):
         if self.busy or not self.session:
             return
-        if not messagebox.askyesno('Кэш похожести', 'Удалить OCR/NER/layout embeddings для текущего каталога?\nИсходные пути, CSV, SHA точных дублей, прежние отпечатки содержимого и статистика сохранятся.\nСледующая группировка заново обработает до трёх страниц документа.'):
+        if not messagebox.askyesno('Кэш похожести', 'Удалить OCR/NER/layout embeddings для текущего каталога?\nИсходные пути, CSV, SHA точных дублей, прежние отпечатки содержимого и статистика сохранятся.\nСледующая группировка заново обработает первую страницу PDF или выборку текста других форматов.'):
             return
         def done(_):
             self.similarity_notes, self.similarity_groups, self.similarity_ranks = {}, {}, {}
@@ -1080,7 +1098,7 @@ class App:
                       ('DmlExecutionProvider', 'CUDAExecutionProvider') and
                       bool(d.get('similarity', {}).get('ocr_pages')) for d in self.view_docs)
         gpu_text = f'GPU OCR: {gpu_ocr} · ' if gpu_ocr else ''
-        self.status.set(f'{grouped_text}E5 + локальный NER; PDF: первая/средняя/последняя страницы и макет · '
+        self.status.set(f'{grouped_text}E5 + локальный NER; PDF: только первая страница и её макет · '
                         f'{gpu_text}Порог совпадения: {self.similarity_threshold.get():.2f} · '
                         f'Ошибок OCR/embeddings: {unavailable}. '
                         'Цвет текста показывает группу. Основание — под выбранным файлом.')
@@ -1141,6 +1159,18 @@ class App:
             options = dialog.result
             self.run('Добавление к названию', lambda: self.session.add_name_parts(docs, **options, progress=self.tick),
                      self.names_changed)
+
+    def shorten_long_paths(self):
+        if not self.session or self.busy or self.session.read_only:
+            return
+        if not messagebox.askyesno('Сократить длинные названия',
+                'Сократить слишком длинные пути во всём открытом каталоге?\n'
+                'Будут переименованы документы и вложенные папки только там, где это необходимо. '
+                'Расширения и исходные пути в CSV сохранятся. Корневая папка не меняется.'):
+            return
+        from .path_repair import shorten_paths
+        self.run('Сокращение длинных путей', lambda: shorten_paths(self.session, self.tick),
+                 self.names_changed)
 
     def names_changed(self, result):
         summary = f"Переименовано: {result['moved']}. Исходные пути сохранены."
@@ -1686,10 +1716,6 @@ class App:
         if filename:
             self.run('Сопоставление CSV по SHA-256', lambda: self.session.import_structure(filename, self.tick),
                      lambda r: self.result('Структура CSV', f"Совпало файлов: {r['matched']}. Несколько возможных исходных путей: {r['ambiguous']}. Без совпадений: {r['unmatched']}."))
-
-    def reset_plan(self):
-        if self.session and not self.busy:
-            self.run('Сброс оставшегося плана', self.session.cancel_pending)
 
     def close(self):
         log_message('Close requested', pid=os.getpid(), busy=self.busy)

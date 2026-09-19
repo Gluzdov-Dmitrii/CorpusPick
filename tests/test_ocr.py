@@ -44,6 +44,9 @@ class OcrNerTests(unittest.TestCase):
             page = document.new_page(width=600, height=800)
             text = ' '.join(f'synthetic report field {index}' for index in range(12))
             page.insert_textbox((60, 80, 540, 500), text, fontsize=14)
+            for _ in range(4):
+                later = document.new_page(width=600, height=800)
+                later.insert_text((60, 80), 'LATER PAGE MUST NOT BE SAMPLED')
             document.save(path)
             document.close()
             result = sample_pdf(path, None)
@@ -52,10 +55,14 @@ class OcrNerTests(unittest.TestCase):
         self.assertEqual(result['ocr_pages'], 0)
         self.assertFalse(result['ocr_failed'])
         self.assertEqual(result['layout'].shape, (384,))
+        self.assertEqual(result['page_count'], 5)
+        self.assertEqual(len(result['texts']), 1)
+        self.assertNotIn('LATER PAGE', result['texts'][0])
+        self.assertFalse(np.any(result['layout'][128:]))
 
     @unittest.skipUnless(os.environ.get('CORPUSPICK_TEST_OCR') == '1',
                          'Optional local Cyrillic OCR integration')
-    def test_scanned_russian_pdf_first_middle_last(self):
+    def test_scanned_russian_pdf_first_page(self):
         from PIL import Image, ImageDraw, ImageFont
         import pymupdf
 
